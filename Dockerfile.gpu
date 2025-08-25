@@ -1,0 +1,24 @@
+# PyTorch 2.3.1 + CUDA 11.8
+FROM pytorch/pytorch:2.4.1-cuda11.8-cudnn9-runtime 
+
+# Minimal system deps for opencv-python-headless
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# (optional but recommended)
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+COPY requirements.gpu.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY model_min.py trainer_light.py infer_light.py app.py ./
+
+ENV PORT=8080
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

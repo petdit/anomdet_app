@@ -1,0 +1,27 @@
+# OS/Editor
+.DS_Store
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+build/
+
+# Env/Secrets
+.env
+.env.*
+*.local
+
+# Logs
+*.log
+
+# Misc
+coverage/
+*.coverage

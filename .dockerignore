@@ -1,0 +1,27 @@
+# keep the build context tiny
+*.mp4
+*.avi
+*.mov
+*.zip
+*.tar
+*.tar.gz
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.env
+venv/
+env/
+.build/
+dist/
+build/
+
+results/
+data/
+datasets/
+checkpoints/
+outputs/
+
+.git/
