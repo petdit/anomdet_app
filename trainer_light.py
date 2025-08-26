@@ -1,5 +1,4 @@
 import os, json, tempfile
-from typing import List
 import cv2
 import numpy as np
 import torch
@@ -9,6 +8,8 @@ from google.cloud import storage
 from model_min import CNN_TSM
 import random
 from pytorch_msssim import ms_ssim
+from collections import deque
+
 
 IM_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1)
 IM_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1)
@@ -33,33 +34,71 @@ def gcs_upload(local_path: str, gcs_uri: str):
     storage.Client().bucket(bucket).blob(path).upload_from_filename(local_path)
 
 # ---------- video -> frames ----------
-def extract_frames(video_path: str, size=224):
-    """
-    Reads every frame, crops to a square without stretching,
-    then resizes to size×size. For tall videos (H>W) we keep the bottom WxW.
-    For wide videos (W>H), we center-crop.
-    Returns: list of HWC RGB uint8 frames.
-    """
+
+
+def frames_iter(video_path: str, size=224, frame_step=1, max_frames=None):
     cap = cv2.VideoCapture(video_path)
-    frames = []
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+    kept = 0
+    idx = 0
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
-        frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        H, W, _ = frame.shape
-        if H == W:
-            square = frame
-        elif H > W:
-            y0 = H - W
-            square = frame[y0:H, 0:W]
-        else:
-            x0 = (W - H) // 2
-            square = frame[0:H, x0:x0+H]
-        square = cv2.resize(square, (size, size), interpolation=cv2.INTER_AREA)
-        frames.append(square)
+        if (idx % frame_step) == 0:
+            frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            H, W, _ = frame.shape
+            if H == W:
+                square = frame
+            elif H > W:
+                y0 = H - W
+                square = frame[y0:H, 0:W]
+            else:
+                x0 = (W - H) // 2
+                square = frame[0:H, x0:x0+H]
+            square = cv2.resize(square, (size, size), interpolation=cv2.INTER_AREA)
+            yield square  # HWC uint8
+            kept += 1
+            if max_frames is not None and kept >= max_frames:
+                break
+        idx += 1
     cap.release()
-    return frames
+
+def window_batch_iter(video_path: str, T=4, stride=2, batch_size=4,
+                      size=224, frame_step=1, max_frames=None):
+    """
+    Yields FloatTensor batches [B, T, 3, 224, 224] in [0,1],
+    using O(T) memory. Emits a window when buf has T frames,
+    then advances by removing 'stride' frames from the left.
+    """
+    buf = deque(maxlen=T)
+    batch = []
+    for f in frames_iter(video_path, size=size, frame_step=frame_step, max_frames=max_frames):
+        buf.append(f)
+        if len(buf) < T:
+            continue
+
+        # emit window
+        win = np.stack(list(buf), axis=0)              # [T, H, W, 3] uint8
+        win = (win.astype(np.float32) / 255.0)         # [T, H, W, 3]
+        win = np.transpose(win, (0,3,1,2))             # [T, 3, H, W]
+        batch.append(win)
+
+        # advance by 'stride' frames
+        for _ in range(stride):
+            if buf:
+                buf.popleft()
+
+        if len(batch) == batch_size:
+            yield torch.from_numpy(np.stack(batch, axis=0))  # [B,T,3,224,224]
+            batch = []
+
+    if batch:
+        yield torch.from_numpy(np.stack(batch, axis=0))
+
+
+
 
 # ------------- loss functions ------------
 def denorm01(x):
@@ -121,7 +160,7 @@ def apply_augment(batch_btchw, mode="none"):
     if mode == "none":
         return batch_btchw
     B,T,_,H,W = batch_btchw.shape
-    x = batch_btchw
+    x = batch_btchw.clone()  # avoid in-place on the original
     if "light" in mode:
         for b in range(B):
             for t in range(T):
@@ -133,19 +172,6 @@ def apply_augment(batch_btchw, mode="none"):
             x[b] = (x[b] * m).clamp(0,1)
     return x
 
-def make_windows(frames: List[np.ndarray], T=4, stride=2):
-    if len(frames) < T + 1:
-        return []
-    arr = (np.stack(frames).astype(np.float32) / 255.0)  # [N,H,W,3]
-    arr = np.transpose(arr, (0,3,1,2))                   # [N,3,H,W]
-    windows = []
-    for s in range(0, arr.shape[0] - T + 1, stride):
-        windows.append(arr[s:s+T])                       # [T,3,224,224]
-    return windows
-
-def batches(windows, bs=4):
-    for i in range(0, len(windows), bs):
-        yield torch.from_numpy(np.stack(windows[i:i+bs]))  # [B,T,3,224,224]
 
 # ---------- training + export ----------
 def train_on_video(gcs_video_uri: str, out_dir_gcs: str,
@@ -157,11 +183,6 @@ def train_on_video(gcs_video_uri: str, out_dir_gcs: str,
     with tempfile.TemporaryDirectory() as td:
         local_video = os.path.join(td, "clip.mp4")
         gcs_download(gcs_video_uri, local_video)
-
-        frames = extract_frames(local_video, size=224)
-        wins = make_windows(frames, T=seq_len, stride=2)
-        if len(wins) < 4:
-            raise RuntimeError("Not enough frames after sampling; try recording longer.")
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = CNN_TSM(sequence_length=seq_len).to(device)
@@ -180,10 +201,14 @@ def train_on_video(gcs_video_uri: str, out_dir_gcs: str,
         else:
             loss_fn = nn.MSELoss()
 
-        model.train()
+        model.train()        # keep your decoder BN in train mode
+        model.encoder.eval() # freeze encoder BN behavior (no updates, use running stats)
+
         for ep in range(epochs):
             running = 0.0
-            for b in batches(wins, bs=4):
+            num_wins = 0
+            for b in window_batch_iter(local_video, T=seq_len, stride=1, batch_size=4,
+                                    size=224, frame_step=1, max_frames=None):
                 b = b.to(device)                         # [B,T,3,224,224] in [0,1]
                 b = apply_augment(b, mode=augment_mode)  # augment in [0,1]
                 b_norm   = (b - mean5) / std5            # [B,T,3,H,W]
@@ -193,8 +218,12 @@ def train_on_video(gcs_video_uri: str, out_dir_gcs: str,
                 loss = loss_fn(y, tgt_norm)
                 loss.backward()
                 opt.step()
-                running += float(loss.item())
-            print(f"epoch {ep+1}: avg_loss={running / max(1, len(wins)):.6f}")
+                running += float(loss.item()) * b.shape[0]   # weight by batch size
+                num_wins += b.shape[0]
+            if num_wins == 0:
+                raise RuntimeError("Not enough frames after sampling; try recording longer.")
+            print(f"epoch {ep+1}: windows={num_wins}, avg_loss={running / max(1, num_wins):.6f}")
+
 
         # ----- EXPORTS -----
         model.eval()
