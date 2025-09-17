@@ -1,15 +1,13 @@
-import torch
+import os, torch
 import torch.nn as nn
 import torch.nn.functional as F
 _USE_TORCHVISION = False
 try:
-    from torchvision.models import resnet18, ResNet18_Weights  # training container has this
+    from torchvision.models import resnet18, ResNet18_Weights
     _USE_TORCHVISION = True
 except Exception:
-    from resnet18_def import resnet18  # exporter uses this (no torchvision)
-    ResNet18_Weights = None  # just so name exists
-
-
+    from resnet18_def import resnet18
+    ResNet18_Weights = None
 
 class CNN_TSM(nn.Module):
     def __init__(self, sequence_length=4):
@@ -17,15 +15,18 @@ class CNN_TSM(nn.Module):
         self.sequence_length = sequence_length
         C = 512
 
-        if _USE_TORCHVISION and ResNet18_Weights is not None:
+        local_w = os.environ.get("RESNET18_WEIGHTS_PATH")  # e.g. /opt/ml/input/data/pretrained/resnet18.pth
+        if local_w and os.path.exists(local_w):
+            enc = resnet18(weights=None)
+            sd = torch.load(local_w, map_location="cpu")
+            missing, unexpected = enc.load_state_dict(sd, strict=False)
+            print(f"Loaded ResNet18 weights from {local_w}. Missing={len(missing)} Unexpected={len(unexpected)}")
+        elif _USE_TORCHVISION and ResNet18_Weights is not None:
             enc = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-            print("using torchvision ")
+            print("Loaded torchvision IMAGENET1K_V1 weights (network access may be needed)")
         else:
-            enc = resnet18()  # local copy, random init (we load checkpoint next)
-            print("using fallback, no loaded weights")
-
-
-
+            enc = resnet18()
+            print("Using fallback, no pretrained weights")
 
         enc.fc = nn.Identity()
         self.encoder = enc

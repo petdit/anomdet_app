@@ -1,0 +1,54 @@
+# ---------- Base: CUDA + PyTorch runtime for training ----------
+FROM pytorch/pytorch:2.4.1-cuda11.8-cudnn9-runtime
+
+# Minimal libs for OpenCV headless etc. + flatc for ExecuTorch Vulkan + Vulkan loader
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 libsm6 libxext6 libxrender1 ca-certificates \
+    flatbuffers-compiler libvulkan1 \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64
+
+WORKDIR /app
+
+# ---------- Create two virtual envs ----------
+# TRAIN venv reuses system site-packages so it SEES the huge torch/cuda from the base image
+RUN python -m venv --system-site-packages /opt/train-venv  && /opt/train-venv/bin/pip  install -U pip setuptools wheel && \
+    python -m venv                         /opt/convert-venv && /opt/convert-venv/bin/pip install -U pip setuptools wheel
+
+# ---------- Install training deps (avoid pulling torch again) ----------
+RUN /opt/train-venv/bin/pip install --no-cache-dir --no-compile \
+      numpy==1.26.4 \
+      opencv-python-headless==4.9.0.80
+RUN /opt/train-venv/bin/pip install --no-cache-dir --no-deps --no-compile \
+      pytorch-msssim==1.0.0
+
+# TorchVision for CUDA, without reinstalling torch
+RUN /opt/train-venv/bin/pip install --no-cache-dir --no-deps \
+    --index-url https://download.pytorch.org/whl/cu118 \
+    torchvision==0.19.1
+
+# ---------- Install convert deps (CPU torch lives here) ----------
+COPY requirements.convert.txt /app/requirements.convert.txt
+# Use the CPU torch index only for this install step
+RUN PIP_INDEX_URL=https://download.pytorch.org/whl/cpu \
+    PIP_EXTRA_INDEX_URL=https://pypi.org/simple \
+    /opt/convert-venv/bin/pip install --no-cache-dir --no-compile \
+    -r /app/requirements.convert.txt
+
+# ---------- Copy code ----------
+COPY paths.py model_min.py trainer_light.py train_entry.py \
+    resnet18_def.py convert_entry.py run_train_then_convert.py ./
+
+# ---------- Housekeeping: trim pyc / caches inside venvs ----------
+RUN find /opt/train-venv   -type d -name "__pycache__" -prune -exec rm -rf {} + && \
+    find /opt/convert-venv -type d -name "__pycache__" -prune -exec rm -rf {} +
+
+# ---------- Entrypoint ----------
+ENV VENV_TRAIN_PY=/opt/train-venv/bin/python \
+    VENV_CONVERT_PY=/opt/convert-venv/bin/python
+ENTRYPOINT ["/opt/train-venv/bin/python","-u","/app/run_train_then_convert.py"]

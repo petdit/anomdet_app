@@ -1,27 +1,47 @@
 # keep the build context tiny
-*.mp4
-*.avi
-*.mov
-*.zip
-*.tar
-*.tar.gz
 
+# VCS & editor noise
+.git
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+.DS_Store
+
+# Python caches & build artifacts
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.so
 *.pyd
-
-.env
+.build/
+build/
+dist/
+pip-wheel-metadata/
+.venv/
 venv/
 env/
-.build/
-dist/
-build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
 
+# Notebooks
+*.ipynb
+**/.ipynb_checkpoints/
+
+# Large media & archives (recursive)
+**/*.mp4
+**/*.avi
+**/*.mov
+**/*.zip
+**/*.tar
+**/*.tar.gz
+
+# Project data / outputs
 results/
 data/
 datasets/
 checkpoints/
 outputs/
-
-.git/
+wandb/
+mlruns/
