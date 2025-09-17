@@ -9,6 +9,7 @@ __pycache__/
 .venv/
 venv/
 
+
 # Node
 node_modules/
 dist/
@@ -25,3 +26,9 @@ build/
 # Misc
 coverage/
 *.coverage
+
+out_model/
+sample_input/training/out/
+*.pth
+*.pt
+*.ts.pt
