@@ -1,1 +1,0 @@
-{"sequence_length": 4, "input_size": [3, 224, 224], "train_clip_local": "/opt/ml/input/data/training/video.mp4", "augment": "std", "loss_mode": "combined", "alpha": 0.7, "beta": 0.17, "gamma": 0.13, "epochs": 5, "lr": 0.0005, "sampler": {"native_fps": 24.54575151416162, "fps": null, "keep_every": 1, "seq_len": 4, "stride_effective": 1, "sequences_per_epoch": 4000}, "seed": 1337}
