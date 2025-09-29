@@ -31,6 +31,8 @@ sample_input/training/out/
 *.pth
 *.pt
 *.ts.pt
+*.pte
+sample_input/training/**/artifacts/
 
 # --- Added: data/media files to avoid pushing ---
 *.[Cc][Ss][Vv]
@@ -40,3 +42,4 @@ sample_input/training/out/
 # (optional) also ignore JPEG by full extension
 *.[Jj][Pp][Ee][Gg]
 *.[Jj][Ss][Oo][Nn]
+
