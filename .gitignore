@@ -9,7 +9,6 @@ __pycache__/
 .venv/
 venv/
 
-
 # Node
 node_modules/
 dist/
@@ -32,3 +31,12 @@ sample_input/training/out/
 *.pth
 *.pt
 *.ts.pt
+
+# --- Added: data/media files to avoid pushing ---
+*.[Cc][Ss][Vv]
+*.[Pp][Nn][Gg]
+*.[Jj][Pp][Gg]
+*.[Mm][Pp]4
+# (optional) also ignore JPEG by full extension
+*.[Jj][Pp][Ee][Gg]
+*.[Jj][Ss][Oo][Nn]

@@ -37,6 +37,10 @@ def main():
     video = _find_single_mp4(SM_TRAIN_DIR)
     h = _load_hps()
 
+
+
+    
+
     epochs     = int(h.get("epochs",     _env("ET_EPOCHS",     int,   1)))
     lr         = float(h.get("lr",       _env("ET_LR",         float, 5e-4)))
     augment    = str(h.get("augment",    _env("ET_AUGMENT",    str,   "std")))
@@ -48,12 +52,31 @@ def main():
     batch_size = int(h.get("batch_size", _env("ET_BATCH_SIZE", int,   16)))
     size       = int(h.get("size",       _env("ET_SIZE",       int,   224)))
     seed       = h.get("seed",           _env("ET_SEED",       int,   None))
-    fps                 = h.get("fps",                  _env("ET_FPS",                 float, None))
+    keep_every = h.get("keep_every",     _env("ET_KEEP_EVERY", int, None))
+    lr_encoder_l4 = float(h.get("lr_encoder_l4", _env("ET_LR_ENCODER_L4", float, 5e-5)))
+    threads       = int(h.get("threads",       _env("ET_THREADS",       int,   0)))   # 0 = ffmpeg auto
+    overwrite     = bool(h.get("overwrite_cache", _env_bool("ET_OVERWRITE_CACHE", False)))
+    vis_sequences = int(h.get("vis_sequences", _env("ET_VIS_SEQUENCES",  int,   0)))
     sequences_per_epoch = h.get("sequences_per_epoch",  _env("ET_SEQUENCES_PER_EPOCH", int,   None))
-
+    
     # optional training artifact toggles (default True)
     save_weights = bool(h.get("save_weights", _env_bool("ET_SAVE_WEIGHTS", True)))
     save_ts      = bool(h.get("save_ts",      _env_bool("ET_SAVE_TS",      True)))
+    roi_val = h.get("roi", None)
+    if isinstance(roi_val, str):
+        try:
+            import json as _json
+            roi_val = tuple(_json.loads(roi_val))
+        except Exception:
+            parts = [p.strip() for p in roi_val.split(",")]
+            roi_val = tuple(int(x) for x in parts) if len(parts) == 4 else None
+    elif isinstance(roi_val, list):
+        roi_val = tuple(roi_val)
+    elif not isinstance(roi_val, tuple):
+        roi_val = None
+
+    if keep_every is not None and keep_every < 2:
+        keep_every = None  # treat 0/1 as "keep all"
 
     res = train_on_video_local(
         video, SM_MODEL_DIR,
@@ -62,14 +85,16 @@ def main():
         alpha=alpha, beta=beta, gamma=gamma,
         batch_size=batch_size, size=size,
         seed=seed, save_weights=save_weights, save_ts=save_ts,
-        fps=fps, sequences_per_epoch=sequences_per_epoch
+        keep_every=keep_every, sequences_per_epoch=sequences_per_epoch, 
+        roi=roi_val, threads=threads, overwrite_cache=overwrite,
+        lr_encoder_l4=lr_encoder_l4, vis_sequences=vis_sequences
     )
     print(json.dumps({"ok": True, "resolved": {
         "epochs": epochs, "lr": lr, "seq_len": seq_len,
         "augment": augment, "loss_mode": loss_mode,
         "alpha": alpha, "beta": beta, "gamma": gamma,
         "batch_size": batch_size, "size": size,
-        "fps": fps, "sequences_per_epoch": sequences_per_epoch,
+        "keep_every": keep_every, "sequences_per_epoch": sequences_per_epoch, "roi": roi_val, 
         "seed": seed, "save_weights": save_weights, "save_ts": save_ts
     }, "result": res}))
 

@@ -93,7 +93,7 @@ def main():
         lowered = to_edge_transform_and_lower(ep, partitioner=_get_partitioners(backend))
         et_prog = lowered.to_executorch()
 
-        out_pte = os.path.join(OUT_DIR, f"model.{args.backend}.pte")
+        out_pte = os.path.join(OUT_DIR, f"model.{backend}.pte")
         with open(out_pte, "wb") as f:
             f.write(et_prog.buffer)
         print(f"Wrote {out_pte}")

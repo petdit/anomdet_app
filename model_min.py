@@ -17,7 +17,10 @@ class CNN_TSM(nn.Module):
 
         local_w = os.environ.get("RESNET18_WEIGHTS_PATH")  # e.g. /opt/ml/input/data/pretrained/resnet18.pth
         if local_w and os.path.exists(local_w):
-            enc = resnet18(weights=None)
+            if _USE_TORCHVISION:
+                enc = resnet18(weights=None)     # torchvision factory
+            else:
+                enc = resnet18()                  # your resnet18_def (no kwargs)
             sd = torch.load(local_w, map_location="cpu")
             missing, unexpected = enc.load_state_dict(sd, strict=False)
             print(f"Loaded ResNet18 weights from {local_w}. Missing={len(missing)} Unexpected={len(unexpected)}")
@@ -35,12 +38,16 @@ class CNN_TSM(nn.Module):
 
         self.dec1 = nn.Sequential(nn.Conv2d(512, 256, 3, padding=1),
                                   nn.BatchNorm2d(256), nn.ReLU())
+        
         self.dec2 = nn.Sequential(nn.Conv2d(256, 128, 3, padding=1),
                                   nn.BatchNorm2d(128), nn.ReLU())
+        
         self.dec3 = nn.Sequential(nn.Conv2d(128, 64, 3, padding=1),
                                   nn.BatchNorm2d(64), nn.ReLU())
+        
         self.dec4 = nn.Sequential(nn.Conv2d(64, 32, 3, padding=1),
                                   nn.BatchNorm2d(32), nn.ReLU())
+        
         self.out  = nn.Conv2d(32, 3, 3, padding=1)
 
     def forward(self, x):  # x: [B,T,3,224,224] -> y: [B,3,224,224]

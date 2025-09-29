@@ -3,6 +3,10 @@ import os, sys, json, argparse, shutil, subprocess
 
 from paths import SM_TRAIN_IN, SM_MODEL_DIR, SM_PROC_IN, SM_PROC_OUT
 
+# SageMaker BYO training containers are invoked as:  docker run <image> train
+# Drop that positional arg if present so argparse doesn't fail.
+if len(sys.argv) > 1 and sys.argv[1] == "train":
+    sys.argv.pop(1)
 
 
 def run(cmd, env=None):
@@ -16,7 +20,11 @@ def main():
                     choices=["vulkan", "xnnpack", "nnapi"])
     ap.add_argument("--skip-convert", action="store_true", help="Run training only.")
 
-    args = ap.parse_args()
+
+    args, unknown = ap.parse_known_args()
+    if unknown:
+        print(f"[warn] ignoring extra launcher args: {unknown}", flush=True)
+
 
     os.makedirs(SM_TRAIN_IN, exist_ok=True)
     os.makedirs(SM_MODEL_DIR, exist_ok=True)
@@ -89,8 +97,35 @@ def main():
     # 2) CONVERT
     conv_cmd = ["/opt/convert-venv/bin/python", "convert_entry.py", "--backend", args.backend]
     run(conv_cmd)
+
+    try:
+        os.makedirs(SM_MODEL_DIR, exist_ok=True)
+        # copy files/dirs from SM_PROC_OUT -> SM_MODEL_DIR, overwriting quietly
+        for name in os.listdir(SM_PROC_OUT):
+            src = os.path.join(SM_PROC_OUT, name)
+            dst = os.path.join(SM_MODEL_DIR, name)
+            if os.path.isdir(src):
+                # Python 3.8+: dirs_exist_ok True will merge into dst if already exists
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+        print(f"Mirrored converter outputs from '{SM_PROC_OUT}' -> '{SM_MODEL_DIR}'")
+    except Exception as e:
+        print(f"WARNING: failed to copy converter outputs into model dir: {e}")
+        
     print(json.dumps({"ok": True, "phase": "full",
                     "model_src": SM_MODEL_DIR, "convert_out": SM_PROC_OUT}))
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        try:
+            os.makedirs("/opt/ml/output", exist_ok=True)
+            with open("/opt/ml/output/failure", "w") as f:
+                f.write(str(e))
+        except Exception:
+            pass
+        raise
