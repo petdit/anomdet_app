@@ -1,0 +1,13 @@
+name: ort-nhwc-smoketest
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy>=1.26,<2.0
+  - protobuf>=4.25,<5.0
+  - onnx>=1.16
+  - pip:
+      - onnxruntime==1.23.1
+      - onnx-graphsurgeon==0.5.8
+      - onnxsim>=0.4.36

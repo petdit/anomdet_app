@@ -37,25 +37,33 @@ RUN /opt/train-venv/bin/pip install --no-cache-dir --no-deps \
 
 # ---------- Install convert deps (CPU torch lives here) ----------
 COPY requirements.convert.txt /app/requirements.convert.txt
+# Echo for debugging to ensure the right file is in the image
+RUN echo "=== requirements.convert.txt in image ===" && cat /app/requirements.convert.txt
 
 
-# Use the CPU torch index only for this install step 
-RUN PIP_INDEX_URL=https://download.pytorch.org/whl/cpu \ 
-  PIP_EXTRA_INDEX_URL=https://pypi.org/simple \ 
-  /opt/convert-venv/bin/pip install --no-cache-dir --no-compile \ 
-  -r /app/requirements.convert.txt
+# 1) Install ONLY torch from the Torch CPU index (isolated step)
+RUN /opt/convert-venv/bin/pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cpu \
+      torch==2.8.0
 
+# 2) Install the rest from PyPI (clear index vars so we don't use the torch index)
+RUN PIP_INDEX_URL= PIP_EXTRA_INDEX_URL= /opt/convert-venv/bin/pip install --no-cache-dir -r /app/requirements.convert.txt
 
-COPY paths.py model_min.py trainer_light.py train_entry.py \ 
-resnet18_def.py convert_entry.py run_train_then_convert.py ./
+# 3) Build-time sanity check: fail if onnx/onnxruntime aren't importable in the converter venv
+RUN /opt/convert-venv/bin/python - <<'PY'
+import onnx, onnxruntime
+print("onnx ok:", onnx.__version__, "  ort ok:", onnxruntime.__version__)
+PY
 
+# App files
+COPY paths.py model_min.py trainer_light.py train_entry.py \
+     resnet18_def.py convert_entry.py run_train_then_convert.py ./
 
-# ---------- Housekeeping: trim pyc / caches inside venvs ---------- 
-    RUN find /opt/train-venv -type d -name "__pycache__" -prune -exec rm -rf {} + && \ 
+# ---------- Housekeeping: trim pyc / caches inside venvs ----------
+RUN find /opt/train-venv -type d -name "__pycache__" -prune -exec rm -rf {} + && \
     find /opt/convert-venv -type d -name "__pycache__" -prune -exec rm -rf {} +
 
-
-    # ---------- Entrypoint ---------- 
-        ENV VENV_TRAIN_PY=/opt/train-venv/bin/python \ 
-        VENV_CONVERT_PY=/opt/convert-venv/bin/python 
-        ENTRYPOINT ["/opt/train-venv/bin/python","-u","/app/run_train_then_convert.py"]
+# ---------- Entrypoint ----------
+ENV VENV_TRAIN_PY=/opt/train-venv/bin/python \
+    VENV_CONVERT_PY=/opt/convert-venv/bin/python
+ENTRYPOINT ["/opt/train-venv/bin/python","-u","/app/run_train_then_convert.py"]

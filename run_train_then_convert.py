@@ -16,8 +16,6 @@ def run(cmd, env=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", help="Optional path to an MP4. If omitted, one must exist under /opt/ml/input/data/training/")
-    ap.add_argument("--backend", default=os.getenv("ET_BACKEND", "vulkan"),
-                    choices=["vulkan", "xnnpack", "nnapi"])
     ap.add_argument("--skip-convert", action="store_true", help="Run training only.")
     ap.add_argument("--convert-precision", choices=["16","32"], default=None,
                 help="Forwarded to converter; overridden by JSON/env inside converter.")
@@ -97,7 +95,9 @@ def main():
                 shutil.copy2(src, dst)
 
     # 2) CONVERT
-    conv_cmd = ["/opt/convert-venv/bin/python", "convert_entry.py", "--backend", args.backend]
+    conv_cmd = ["/opt/convert-venv/bin/python", "convert_entry.py",
+               "--opset", "18", "--onnx-out", "model.onnx", "--emit-ort"]
+    
     if args.convert_precision is not None:
         conv_cmd += ["--convert-precision", args.convert_precision]
     run(conv_cmd)

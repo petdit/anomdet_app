@@ -1,6 +1,9 @@
 import os, tarfile, json, shutil, tempfile, argparse
 import torch
-from model_min import CNN_TSM
+import onnx
+import onnxruntime as ort
+from model_min import CNN_TSM_NNAPI  
+
 from paths import SM_PROC_IN as IN_DIR, SM_PROC_OUT as OUT_DIR
 
 HP_PATH = "/opt/ml/input/config/hyperparameters.json"
@@ -55,20 +58,6 @@ def _find(path, names):
     return None
 
 
-def _get_partitioners(backend: str):
-    if backend == "xnnpack":
-        from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
-
-        return [XnnpackPartitioner()]
-    elif backend == "vulkan":
-        from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
-
-        return [VulkanPartitioner()]
-    elif backend == "nnapi":
-        raise RuntimeError("NNAPI partitioner not available in this build; use xnnpack or vulkan.")
-    else:
-        raise RuntimeError(f"Unknown backend: {backend}")
-
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -80,12 +69,17 @@ def _env_flag(name: str, default: bool = False) -> bool:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--backend",
-        default=None,
-        choices=["xnnpack", "vulkan", "nnapi"],
-        help="ExecuTorch backend to lower to.",
+        "--opset",
+        type=int,
+        default=18,
+        help="ONNX opset version to export with (default: 18).",
     )
-    # simple, optional copies of the trained artifacts to OUT_DIR:
+    ap.add_argument(
+        "--onnx-out",
+        default="model.onnx",
+        help="Output ONNX filename (default: model.onnx).",
+    )
+
     ap.add_argument(
         "--save-weights",
         action="store_true",
@@ -102,6 +96,8 @@ def main():
         default=None,
         help="Export precision: 16 for fp16, 32 for fp32 (JSON/env override this).",
     )
+    ap.add_argument("--emit-ort", action="store_true",
+                help="Also save an ORT-optimized graph (.ort) for faster mobile load.")
 
     args = ap.parse_args()
 
@@ -111,7 +107,6 @@ def main():
     convert_precision = _resolve_convert_precision(args.convert_precision)
     to_half = convert_precision == "16"
     os.makedirs(OUT_DIR, exist_ok=True)
-    backend = args.backend or os.getenv("ET_BACKEND") or "vulkan"
     tmp = tempfile.mkdtemp()
     try:
         # support model.tar.gz (SageMaker) or plain folder
@@ -133,46 +128,80 @@ def main():
                 m = json.load(f)
             seq_len = int(m.get("sequence_length", 4))
 
-        # preferred export path: rebuild model + load weights
+        size = 224
+        in_size = m.get("input_size", [3, 224, 224]) if meta and os.path.isfile(meta) else [3, 224, 224]
+        if isinstance(in_size, (list, tuple)) and len(in_size) == 3:
+            size = int(in_size[1])
+        
+
+
+
+        # Build model + example input (preferred path: plain nn.Module with loaded weights)
+        model = None
+
+        example = torch.randn(seq_len, 3, size, size)  # [T,3,S,S]
         if weights and os.path.isfile(weights):
-            model = CNN_TSM(sequence_length=seq_len).eval()
+            model = CNN_TSM_NNAPI(sequence_length=seq_len, spatial_size=size).eval()
             sd = torch.load(weights, map_location="cpu")
             missing, unexpected = model.load_state_dict(sd, strict=False)
-            print(f"Loaded weights. Missing={len(missing)} Unexpected={len(unexpected)}")
-
-            from torch.export import export as torch_export
-
-            example = torch.randn(1, seq_len, 3, 224, 224)
+            print(f"Loaded weights into CNN_TSM_NNAPI. Missing={len(missing)} Unexpected={len(unexpected)}")
             if to_half:
                 model = model.half()
                 example = example.half()
-            ep = torch_export(model, (example,))
-
         elif ts_pt and os.path.isfile(ts_pt):
-            # fallback if only TorchScript exists
-            traced = torch.jit.load(ts_pt, map_location="cpu").eval()
-            from torch.export import export as torch_export
-
-            example = torch.randn(1, seq_len, 3, 224, 224)
+            # Fallback: ONNX export directly from TorchScript if needed
+            model = torch.jit.load(ts_pt, map_location="cpu").eval()
             if to_half:
-                traced = traced.half()
+                model = model.half()
                 example = example.half()
-            ep = torch_export(traced, (example,))
         else:
             raise RuntimeError("Could not find weights.pth or model.ts.pt in input artifacts")
 
-        # lower to ExecuTorch and write .pte
-        from executorch.exir import to_edge_transform_and_lower
 
-        lowered = to_edge_transform_and_lower(ep, partitioner=_get_partitioners(backend))
-        et_prog = lowered.to_executorch()
 
-        out_pte = os.path.join(OUT_DIR, f"model.{backend}.pte")
-        with open(out_pte, "wb") as f:
-            f.write(et_prog.buffer)
-        print(f"Wrote {out_pte}")
 
-        # always mirror metadata next to the .pte if available
+        os.makedirs(OUT_DIR, exist_ok=True)
+        onnx_path = os.path.join(OUT_DIR, args.onnx_out)
+
+        # Export (static T; keep batch=1 static for mobile perf unless you need dynamic)
+        torch.onnx.export(
+            model,
+            example,
+            onnx_path,
+            opset_version=args.opset,
+            input_names=["input"],
+            output_names=["output"],
+            do_constant_folding=True,
+            dynamic_axes=None,  # set to {"input": {0: "batch"}, "output": {0: "batch"}} ONLY if you truly need variable B
+            keep_initializers_as_inputs=False,   # <<< important
+            export_params=True
+        )
+        print(f"Wrote {onnx_path}")
+
+
+        #sanity check, remove later
+        try:
+            onnx_model = onnx.load(onnx_path)
+            onnx.checker.check_model(onnx_model)
+            sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+            if to_half:  # your existing guard for FP16 export still applies
+                ex32 = example.float().cpu().numpy()
+                with torch.no_grad():
+                    out_torch = model.float()(example.float()).cpu().numpy()
+                out_onnx = sess.run(None, {"input": ex32})[0]
+            else:
+                out_onnx = sess.run(None, {"input": example.cpu().numpy()})[0]
+                with torch.no_grad():
+                    out_torch = model(example).cpu().numpy()
+            max_diff = float(abs(out_onnx - out_torch).max())
+            print(f"[check] ORT vs Torch max_abs_diff={max_diff:.3e}")
+        except Exception as e:
+            print(f"[warn] ONNX check/run failed: {e}")
+
+
+
+
+        # always mirror metadata next to the ONNX if available
         if meta and os.path.isfile(meta):
             shutil.copy2(meta, os.path.join(OUT_DIR, "metadata.json"))
 
@@ -185,11 +214,53 @@ def main():
         if save_ts and ts_pt and os.path.isfile(ts_pt):
             shutil.copy2(ts_pt, os.path.join(OUT_DIR, "model.ts.pt"))
 
-        print(
-            json.dumps(
-                {"ok": True, "output": out_pte, "backend": backend, "convert_precision": convert_precision}
-            )
-        )
+        out = {
+            "ok": True,
+            "format": "onnx",
+            "opset": args.opset,
+            "convert_precision": convert_precision,
+            "outputs": {"onnx": onnx_path}
+        }
+
+
+
+        # --- Merge into metadata.json if it exists next to the produced ONNX/ORT ---
+        def try_merge_out_to_metadata(out_dict, model_path):
+            # Look for metadata.json in the same directory as model_path
+            d = os.path.dirname(model_path)
+            metadata_candidate = os.path.join(d, "metadata.json")
+            if os.path.exists(metadata_candidate):
+                try:
+                    with open(metadata_candidate, "r", encoding="utf-8") as fh:
+                        metadata = json.load(fh)
+                except Exception as e:
+                    print(f"WARNING: failed to read existing metadata.json at {metadata_candidate}: {e}")
+                    metadata = {}
+
+                # Decide which keys to merge — avoid overwriting training-only fields unless explicit
+                metadata.setdefault("converter", {})
+                metadata["converter"].update({
+                    "ok": out_dict.get("ok"),
+                    "format": out_dict.get("format"),
+                    "opset": out_dict.get("opset"),
+                    "convert_precision": out_dict.get("convert_precision"),
+                    "outputs": out_dict.get("outputs")
+                })
+
+                try:
+                    with open(metadata_candidate, "w", encoding="utf-8") as fh:
+                        json.dump(metadata, fh, indent=2, sort_keys=False)
+                    print(f"Merged converter output into {metadata_candidate}")
+                except Exception as e:
+                    print(f"WARNING: failed to write merged metadata.json at {metadata_candidate}: {e}")
+            else:
+                print(f"No metadata.json next to model at {d}; skipping merge")
+
+        # call it with the ONNX path (prefer onnx path variable)
+        if  onnx_path:
+            try_merge_out_to_metadata(out, onnx_path)
+
+
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

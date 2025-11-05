@@ -26,6 +26,7 @@ build/
 coverage/
 *.coverage
 
+# Project-specific outputs
 out_model/
 sample_input/training/out/
 *.pth
@@ -34,12 +35,18 @@ sample_input/training/out/
 *.pte
 sample_input/training/**/artifacts/
 
-# --- Added: data/media files to avoid pushing ---
-*.[Cc][Ss][Vv]
+# --- Data / media / large/binary files to avoid pushing ---
+# Images / media
 *.[Pp][Nn][Gg]
 *.[Jj][Pp][Gg]
-*.[Mm][Pp]4
-# (optional) also ignore JPEG by full extension
 *.[Jj][Pp][Ee][Gg]
+*.[Rr][Gg][Bb]
+*.[Mm][Pp]4
+
+# Data files
+*.[Cc][Ss][Vv]
 *.[Jj][Ss][Oo][Nn]
 
+# Model formats
+*.[Oo][Nn][Nn][Xx]
+*.[Oo][Rr][Tt]
