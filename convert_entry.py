@@ -94,10 +94,8 @@ def main():
         "--convert-precision",
         choices=["16", "32"],
         default=None,
-        help="Export precision: 16 for fp16, 32 for fp32 (JSON/env override this).",
+        help="Export precision: 16 for fp16, 32 for fp32 (JSON/env override this). Have not tested 16 very extensively, may be shit",
     )
-    ap.add_argument("--emit-ort", action="store_true",
-                help="Also save an ORT-optimized graph (.ort) for faster mobile load.")
 
     args = ap.parse_args()
 
@@ -158,8 +156,6 @@ def main():
             raise RuntimeError("Could not find weights.pth or model.ts.pt in input artifacts")
 
 
-
-
         os.makedirs(OUT_DIR, exist_ok=True)
         onnx_path = os.path.join(OUT_DIR, args.onnx_out)
 
@@ -177,26 +173,6 @@ def main():
             export_params=True
         )
         print(f"Wrote {onnx_path}")
-
-
-        #sanity check, remove later
-        try:
-            onnx_model = onnx.load(onnx_path)
-            onnx.checker.check_model(onnx_model)
-            sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-            if to_half:  # your existing guard for FP16 export still applies
-                ex32 = example.float().cpu().numpy()
-                with torch.no_grad():
-                    out_torch = model.float()(example.float()).cpu().numpy()
-                out_onnx = sess.run(None, {"input": ex32})[0]
-            else:
-                out_onnx = sess.run(None, {"input": example.cpu().numpy()})[0]
-                with torch.no_grad():
-                    out_torch = model(example).cpu().numpy()
-            max_diff = float(abs(out_onnx - out_torch).max())
-            print(f"[check] ORT vs Torch max_abs_diff={max_diff:.3e}")
-        except Exception as e:
-            print(f"[warn] ONNX check/run failed: {e}")
 
 
 

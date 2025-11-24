@@ -13,6 +13,11 @@ IM_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1)
 IMN_MEAN_5D = IM_MEAN.view(1,1,3,1,1)
 IMN_STD_5D  = IM_STD.view(1,1,3,1,1)
 
+
+IMN_MEAN_4D = IM_MEAN            # [1,3,1,1]
+IMN_STD_4D  = IM_STD             # [1,3,1,1]
+
+
 def denorm01(x):  # x normalized -> [0,1]
     m, s = IM_MEAN.to(x.device), IM_STD.to(x.device)
     return (x * s + m).clamp(0, 1)
@@ -108,11 +113,14 @@ def memmap_window_batch_iter(cache_dir: str, *, T: int, batch_size: int, return_
         else:              yield bt
 
 # ---- metrics: PSNR (RGB on [0,1]) and luma-MSE ----
-def luma(x01: torch.Tensor) -> torch.Tensor:
-    return 0.299*x01[:,0:1] + 0.587*x01[:,1:2] + 0.114*x01[:,2:3]
 
-def mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return torch.mean((a - b) ** 2, dim=(1,2,3))  # per-sample
+
+def psnr_luma(a01: torch.Tensor, b01: torch.Tensor, eps=1e-12) -> torch.Tensor:
+    # a01,b01: [B,3,H,W] in [0,1]
+    Y1 = 0.299*a01[:,0:1] + 0.587*a01[:,1:2] + 0.114*a01[:,2:3]
+    Y2 = 0.299*b01[:,0:1] + 0.587*b01[:,1:2] + 0.114*b01[:,2:3]
+    mse_y = torch.mean((Y1 - Y2) ** 2, dim=(1,2,3)).clamp_min(eps)
+    return 10.0 * torch.log10(1.0 / mse_y)
 
 def psnr_rgb(a01: torch.Tensor, b01: torch.Tensor, eps=1e-12) -> torch.Tensor:
     per = torch.mean((a01 - b01) ** 2, dim=(1,2,3)).clamp_min(eps)
@@ -140,6 +148,12 @@ def _pick_providers(prefer_cuda: bool = True):
     if not order:
         order = list(avail)
     return order
+def _mean_std_chw(chw: torch.Tensor):
+    # chw: [3,H,W], normalized; returns ( (mr,mg,mb), (sr,sg,sb) )
+    c = chw.reshape(3, -1)
+    m = c.mean(dim=1)
+    s = c.std(dim=1, unbiased=False)
+    return m.tolist(), s.tolist()
 
 
 def main():
@@ -157,6 +171,11 @@ def main():
     ap.add_argument("--save_npy", action="store_true", help="Also save psnr.npy and luma_mse.npy")
     ap.add_argument("--fp16", action="store_true", help="Force FP16 input to match an fp16-exported model")
     ap.add_argument("--cpu", action="store_true", help="Force CPUExecutionProvider")
+    ap.add_argument("--stat_every", type=int, default=1,
+                help="If >0, log per-frame mean/std every Nth window (normalized space).")
+    ap.add_argument("--stat_samples", type=int, default=1,
+                help="How many batch samples to log per matching window.")
+
     args = ap.parse_args()
 
     # ROI parse
@@ -216,43 +235,87 @@ def main():
     device = "cuda" if (torch.cuda.is_available() and not args.cpu) else "cpu"
     mean5 = IMN_MEAN_5D.to(device); std5 = IMN_STD_5D.to(device)
 
-    all_starts, all_psnr, all_luma_mse = [], [], []
+    all_starts, all_psnr_rgb, all_psnr_luma = [], [], []
 
-    # Inference loop:
-    # Your ONNX takes [T,3,S,S] and returns [3,S,S]; no batch dim -> run per-sample window.
     with torch.no_grad():
         for b_u8, starts in memmap_window_batch_iter(cache_dir, T=T, batch_size=args.batch_size, return_indices=True):
             if device == "cuda":
                 b_u8 = b_u8.pin_memory()
             b01 = b_u8.to(device=device, dtype=torch.float32, non_blocking=(device=="cuda")).div_(255.0)
 
-            b_in  = b01[:, :seq_len]   # [B,seq,3,H,W], no aug
+            b_in  = b01[:, :seq_len]   # [B,seq,3,H,W]
             tgt01 = b01[:,  seq_len]   # [B,3,H,W]
 
             # Normalize like training
-            x_norm = (b_in - mean5) / std5  # torch tensor [B,seq,3,H,W]
+            x_norm = (b_in - mean5) / std5  # [B,seq,3,H,W]
 
-            # Run ONNX per sample (no batch axis in model)
+            # -------- stats logging (normalized space) --------
+            if getattr(args, "stat_every", 0):
+                se = int(args.stat_every)
+                if se > 0:
+                    samples_to_log = min(int(getattr(args, "stat_samples", 1)), x_norm.shape[0])
+                    for bi in range(samples_to_log):
+                        start_idx = int(starts[bi])
+                        if (start_idx % se) != (se - 1):
+                            continue
+
+                        # inputs per time step
+                        xin = x_norm[bi]  # [seq,3,H,W]
+                        for t in range(xin.shape[0]):
+                            m, s = _mean_std_chw(xin[t])
+                            print(
+                                f"PY win={start_idx} t={t} input.norm "
+                                f"mean=[{m[0]:.4f} {m[1]:.4f} {m[2]:.4f}] "
+                                f"std=[{s[0]:.4f} {s[1]:.4f} {s[2]:.4f}]"
+                            )
+
+            # -------- ONNX run (per-sample; model has no batch axis) --------
             preds = []
             for i in range(x_norm.shape[0]):
                 xin = x_norm[i]  # [seq,3,H,W]
                 np_in = (xin.half() if use_fp16 else xin.float()).cpu().numpy()
-                np_in = np.ascontiguousarray(np_in)  # NEW
-                out = sess.run([output_name], {input_name: np_in})[0]  # [3,H,W], dtype fp16/fp32
-                # convert to torch for metrics; keep on CPU then move
-                y_norm = torch.from_numpy(out).to(device=device, dtype=torch.float32)  # promote to fp32 for metrics
+                np_in = np.ascontiguousarray(np_in)
+                out = sess.run([output_name], {input_name: np_in})[0]  # [3,H,W]
+                y_norm = torch.from_numpy(out).to(device=device, dtype=torch.float32)  # normalized space
                 preds.append(y_norm)
             y_norm_b = torch.stack(preds, dim=0)   # [B,3,H,W] normalized
 
-            pred01 = denorm01(y_norm_b)            # [B,3,H,W] in [0,1]
+            # -------- more stats: pred + target (normalized) --------
+            if getattr(args, "stat_every", 0):
+                se = int(args.stat_every)
+                if se > 0:
+                    samples_to_log = min(int(getattr(args, "stat_samples", 1)), y_norm_b.shape[0])
+                    for bi in range(samples_to_log):
+                        start_idx = int(starts[bi])
+                        if (start_idx % se) != (se - 1):
+                            continue
 
-            # metrics
-            _psnr = psnr_rgb(pred01, tgt01)                    # [B]
-            _lmse = mse(luma(pred01), luma(tgt01))             # [B]
+                        # prediction (normalized)
+                        pm, ps = _mean_std_chw(y_norm_b[bi])
+                        print(
+                            f"PY win={start_idx} pred.norm "
+                            f"mean=[{pm[0]:.4f} {pm[1]:.4f} {pm[2]:.4f}] "
+                            f"std=[{ps[0]:.4f} {ps[1]:.4f} {ps[2]:.4f}]"
+                        )
+
+                        # target normalized
+                        tgt_norm = (tgt01[bi:bi+1] - IMN_MEAN_4D.to(device)) / IMN_STD_4D.to(device)  # [1,3,H,W]
+                        tm, ts = _mean_std_chw(tgt_norm[0])
+                        tgt_idx = start_idx + seq_len
+                        print(
+                            f"PY win={start_idx} tgt={tgt_idx} target.norm "
+                            f"mean=[{tm[0]:.4f} {tm[1]:.4f} {tm[2]:.4f}] "
+                            f"std=[{ts[0]:.4f} {ts[1]:.4f} {ts[2]:.4f}]"
+                        )
+
+            # -------- metrics on [0,1] --------
+            pred01 = denorm01(y_norm_b).clamp(0,1)
+            _psnr_rgb  = psnr_rgb(pred01, tgt01)   # [B]
+            _psnr_y    = psnr_luma(pred01, tgt01)  # [B]
 
             all_starts.extend(starts.tolist())
-            all_psnr.extend(_psnr.detach().cpu().tolist())
-            all_luma_mse.extend(_lmse.detach().cpu().tolist())
+            all_psnr_rgb.extend(_psnr_rgb.detach().cpu().tolist())
+            all_psnr_luma.extend(_psnr_y.detach().cpu().tolist())
             if saved_pairs < save_cap:
             # save a grid for the first few samples of *this* batch (typically 1 is enough)
                 k = min(3, pred01.shape[0])  # don’t explode disk
@@ -270,16 +333,16 @@ def main():
     # write CSV
     csv_path = os.path.join(args.out_dir, "metrics.csv")
     with open(csv_path, "w") as f:
-        f.write("start_idx,target_idx,psnr_rgb,luma_mse\n")
-        for s, p, m in zip(all_starts, all_psnr, all_luma_mse):
-            f.write(f"{s},{s+seq_len},{p:.6f},{m:.8f}\n")
+        f.write("start_idx,target_idx,psnr_rgb,psnr_luma\n")
+        for s, p_rgb, p_y in zip(all_starts, all_psnr_rgb, all_psnr_luma):
+            f.write(f"{s},{s+seq_len},{p_rgb:.6f},{p_y:.6f}\n")
     print(f"[infer] wrote {csv_path}  rows={len(all_starts)}")
     # --- plots next to CSV ---
     try:
         # x-axis: target frame index
         x = np.array([s + seq_len for s in all_starts], dtype=np.int64)
-        psnr = np.array(all_psnr, dtype=np.float32)
-        lmse = np.array(all_luma_mse, dtype=np.float32)
+        psnr = np.array(all_psnr_rgb, dtype=np.float32)
+        lmse = np.array(all_psnr_luma, dtype=np.float32)
 
         # rolling mean helper
         def rolling_mean(y, w: int):
@@ -323,8 +386,8 @@ def main():
         print(f"[warn] failed to write plots: {e}")
 
     if args.save_npy:
-        np.save(os.path.join(args.out_dir, "psnr_rgb.npy"), np.array(all_psnr, dtype=np.float32))
-        np.save(os.path.join(args.out_dir, "luma_mse.npy"), np.array(all_luma_mse, dtype=np.float32))
+        np.save(os.path.join(args.out_dir, "psnr_rgb.npy"), np.array(all_psnr_rgb, dtype=np.float32))
+        np.save(os.path.join(args.out_dir, "luma_mse.npy"), np.array(all_psnr_luma, dtype=np.float32))
 
 if __name__ == "__main__":
     main()

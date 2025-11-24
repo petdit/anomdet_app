@@ -96,10 +96,15 @@ def main():
 
     # 2) CONVERT
     conv_cmd = ["/opt/convert-venv/bin/python", "convert_entry.py",
-               "--opset", "18", "--onnx-out", "model.onnx", "--emit-ort"]
+               "--opset", "18", "--onnx-out", "model.onnx"]
     
     if args.convert_precision is not None:
         conv_cmd += ["--convert-precision", args.convert_precision]
+    if os.getenv("ET_SAVE_WEIGHTS","true").lower() in {"1","true","yes","y"}:
+        conv_cmd += ["--save-weights"]
+    if os.getenv("ET_SAVE_TS","false").lower() in {"1","true","yes","y"}:
+        conv_cmd += ["--save-ts"]
+
     run(conv_cmd)
 
     try:

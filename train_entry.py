@@ -34,7 +34,15 @@ def _find_single_mp4(search_dir: str) -> str:
 
 
 def main():
-    video = _find_single_mp4(SM_TRAIN_DIR)
+    # Prefer the explicitly staged video.mp4 (used by run_train_then_convert --input)
+    staged = os.path.join(SM_TRAIN_DIR, "video.mp4")
+    if os.path.exists(staged):
+        video = staged
+    else:
+        video = _find_single_mp4(SM_TRAIN_DIR)
+
+    print(f"[train_entry] Using training video: {video}", flush=True)
+
     h = _load_hps()
 
 
@@ -53,7 +61,6 @@ def main():
     size       = int(h.get("size",       _env("ET_SIZE",       int,   224)))
     seed       = h.get("seed",           _env("ET_SEED",       int,   None))
     keep_every = h.get("keep_every",     _env("ET_KEEP_EVERY", int, None))
-    lr_encoder_l4 = float(h.get("lr_encoder_l4", _env("ET_LR_ENCODER_L4", float, 5e-5)))
     threads       = int(h.get("threads",       _env("ET_THREADS",       int,   0)))   # 0 = ffmpeg auto
     overwrite     = bool(h.get("overwrite_cache", _env_bool("ET_OVERWRITE_CACHE", False)))
     vis_sequences = int(h.get("vis_sequences", _env("ET_VIS_SEQUENCES",  int,   0)))
@@ -87,7 +94,7 @@ def main():
         seed=seed, save_weights=save_weights, save_ts=save_ts,
         keep_every=keep_every, sequences_per_epoch=sequences_per_epoch, 
         roi=roi_val, threads=threads, overwrite_cache=overwrite,
-        lr_encoder_l4=lr_encoder_l4, vis_sequences=vis_sequences
+        vis_sequences=vis_sequences
     )
     print(json.dumps({"ok": True, "resolved": {
         "epochs": epochs, "lr": lr, "seq_len": seq_len,

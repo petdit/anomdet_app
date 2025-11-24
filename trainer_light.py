@@ -87,39 +87,87 @@ def _save_sequence_jpegs(seq_tchw_u8: np.ndarray, out_dir: str, prefix: str):
 
 
 # -------------- extraction ------------------
+def _warn_if_not_4_3(video_path: str, tol: float = 0.01):
+    """
+    Print a warning if the source video's aspect ratio is not ~4:3.
+    tol is the allowed absolute difference in aspect ratio (e.g. 0.01 ≈ 1%).
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[warn] Could not open video for aspect check: {video_path}")
+        return
+
+    w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    cap.release()
+
+    if w <= 0 or h <= 0:
+        print(f"[warn] Invalid width/height for aspect check: {video_path} (w={w}, h={h})")
+        return
+
+    ar = w / h
+    target = 4.0 / 3.0
+    if abs(ar - target) > tol:
+        print(
+            f"[warn] Source aspect ratio is {ar:.4f} ({int(w)}x{int(h)}), "
+            f"expected ~4:3 ({target:.4f}). "
+            "Frames will be rescaled to 240x320 before cropping."
+        )
+
 def default_cache_root():
     # User can override in the container / SageMaker job
     return os.environ.get("FRAMECACHE_DIR", "/opt/ml/.cache/frames")
 
 def build_vf_filter(size: int,
-                    roi: tuple[int,int,int,int] | None,
+                    roi: tuple[int, int, int, int] | None,
                     keep_every: int | None) -> str:
     """
-    Build -vf chain:
-      1) exact frame stepping (select=not(mod(n,keep)))
-      2) crop: ROI if provided, else auto (wide=center, tall=bottom) to square
-      3) scale to size×size with flags=area
-      4) format=rgb24
+    Build -vf chain (mirrors Android/Kotlin buildVfFilter):
+      1) optional exact frame stepping (select=not(mod(n,keep)))
+      2a) if ROI is given:
+            crop ROI, then scale to size×size
+         else:
+            scale to 240x320, then crop a size×size square
+            (horizontally centered, bottom-aligned)
+      3) format=rgb24
+      4) setsar=1
     """
-    parts = []
+    parts: list[str] = []
+
+    # 1) Optional decimation
     if keep_every and keep_every > 1:
+        # note: ffmpeg select expression needs quoting; this matches your old code
         parts.append(f"select='not(mod(n,{keep_every}))',setpts=N/FRAME_RATE/TB")
 
     if roi is not None:
+        # 2a) Explicit ROI: crop ROI, then scale to size×size
         x, y, w, h = roi
-        parts.append(f"crop={w}:{h}:{x}:{y}")   # crop to ROI first
-    # square-crop: wide=center, tall=bottom
-    parts.append(
-        "crop="
-        "w='if(gte(iw,ih),ih,iw)':"
-        "h='if(gte(iw,ih),ih,iw)':"
-        "x='if(gte(iw,ih),(iw-ih)/2,0)':"
-        "y='if(gte(iw,ih),0,ih-iw)'"
-    )
+        parts.append(f"crop={w}:{h}:{x}:{y}")
+        parts.append(f"scale={size}:{size}:flags=area")
+    else:
+        # 2b) No ROI: mimic ONLINE rotated pipeline
+        preview_w = 240
+        preview_h = 320
 
-    parts.append(f"scale={size}:{size}:flags=area")
+        # Step 1: scale to 240x320
+        parts.append(f"scale={preview_w}:{preview_h}:flags=area")
+
+        # Step 2: crop size x size from this 240x320 frame
+        crop_x = (preview_w - size) // 2
+        crop_y = preview_h - size
+
+        if crop_x < 0 or crop_y < 0:
+            raise ValueError(
+                f"Cannot crop {size}x{size} from {preview_w}x{preview_h} "
+                f"(computed crop_x={crop_x}, crop_y={crop_y})"
+            )
+
+        parts.append(f"crop={size}:{size}:{crop_x}:{crop_y}")
+
+    # 3) Final format + SAR
     parts.append("format=rgb24")
     parts.append("setsar=1")
+
     return ",".join(parts)
 
 
@@ -210,6 +258,10 @@ def extract_to_memmap(src_video: str, cache_root: str,
     os.makedirs(cache_dir, exist_ok=True)
 
     raw_path = os.path.join(cache_dir, "frames.rgb")
+
+    _warn_if_not_4_3(src_video)
+
+    
     if os.path.exists(raw_path) and not overwrite:
         N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi)
         return cache_dir, N
@@ -397,7 +449,6 @@ def apply_augment(batch_btchw, mode="std"):
 def train_on_video_local(local_video_path: str,
                          out_dir_local: str,
                          seq_len=4, epochs=1, lr=5e-4,
-                         lr_encoder_l4: float =5e-5, 
                          augment_mode="none",
                          loss_mode="combined",
                          alpha=0.7, beta=0.17, gamma=0.13,
@@ -441,14 +492,15 @@ def train_on_video_local(local_video_path: str,
 
     # (optional) freeze encoder
 
-    # ----- below is testing unfreezing the encoder. also makes sure running stats are frozen, which we likely always want.-------------------
-    enable_encoder_bn_affine_only(model)
+    # Full unfreeze (all encoder params trainable)
+    for p in model.encoder.parameters():
+        p.requires_grad = True
 
-    unfreeze_encoder_layer4(model)      # <-- NEW: only layer4 is trainable in encoder
-
+    # Make sure BN layers update running stats during training
     model.train()
-    freeze_encoder_bn_stats(model)   # keep encoder BN in eval() during optimization
-    model.encoder.eval()             # optional, extra safety to not flip encoder accidentally
+    for m in model.encoder.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.train()   # important: do NOT freeze BN stats
 
     l4_params   = [p for n, p in model.named_parameters()
                 if p.requires_grad and n.startswith("encoder.layer4")]
@@ -457,14 +509,9 @@ def train_on_video_local(local_video_path: str,
 
     print(f"[opt] rest_params={sum(p.numel() for p in rest_params):,}  "
         f"layer4_params={sum(p.numel() for p in l4_params):,}  "
-        f"lr_head={lr}  lr_l4={lr_encoder_l4}")
-
-    opt = optim.Adam(
-        [
-            {"params": rest_params, "lr": lr},                  # decoder, fusion, BN-affine (non-L4)
-            {"params": l4_params,   "lr": lr_encoder_l4},       # encoder.layer4 (heavy adaptation)
-        ]
-    )
+        f"lr_head={lr}")
+    
+    opt = optim.Adam(model.parameters(), lr=lr)
     #-------------- encoder stuff end----------------
 
     #opt = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr) #opt when encoder frozen. 
@@ -483,6 +530,7 @@ def train_on_video_local(local_video_path: str,
 
     #sanity check, remove -----------
     def _count_params(pp): return sum(p.numel() for p in pp)
+    
     bn_aff = [m.weight for m in model.encoder.modules() if isinstance(m, nn.BatchNorm2d) and m.affine] + \
             [m.bias   for m in model.encoder.modules() if isinstance(m, nn.BatchNorm2d) and m.affine]
     print(f"[BN-affine baseline] trainable params total={_count_params([p for p in model.parameters() if p.requires_grad])} "
@@ -496,7 +544,6 @@ def train_on_video_local(local_video_path: str,
         print(f"\n=== epoch {ep+1}/{epochs} ===")
 
         model.train()
-        freeze_encoder_bn_stats(model) 
 
         vis_epoch_dir = os.path.join(out_dir_local, "vis", f"epoch_{ep+1:03d}")
         os.makedirs(vis_epoch_dir, exist_ok=True)
@@ -633,7 +680,6 @@ def train_on_video_local(local_video_path: str,
         "loss_mode": loss_mode,
         "alpha": alpha, "beta": beta, "gamma": gamma,
         "epochs": epochs, "lr": lr,
-        "lr_encoder_l4": lr_encoder_l4,
         "sampler": {
             "native_fps": _get_native_fps(local_video_path),
             "keep_every": keep_every,         # now provided directly
