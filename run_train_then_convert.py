@@ -42,21 +42,30 @@ def main():
         return None
 
     if args.input:
-        if not (os.path.isfile(args.input) and args.input.lower().endswith(".mp4")):
-            sys.exit("ERROR: --input must be a readable .mp4 file")
-        if os.path.abspath(args.input) != os.path.abspath(staged):
-            shutil.copy2(args.input, staged)
+        if os.path.isdir(args.input):
+            # Dev mode: --input is a directory (e.g. JPEG dump). Don't stage anything;
+            # train_entry.py will pick it up as a JPEG dir.
+            print(f"[launcher] --input is a directory: {args.input} (JPEG/dev mode)", flush=True)
+        else:
+            # Normal mp4 path
+            if not (os.path.isfile(args.input) and args.input.lower().endswith(".mp4")):
+                sys.exit("ERROR: --input must be a readable .mp4 file or a directory")
+            if os.path.abspath(args.input) != os.path.abspath(staged):
+                shutil.copy2(args.input, staged)
     else:
         existing = _find_mp4(SM_TRAIN_IN)
         if not existing:
-            sys.exit(
-                "ERROR: No .mp4 found under /opt/ml/input/data/training.\n"
-                "Either pass --input /path/to/video.mp4, or mount a file to "
-                "/opt/ml/input/data/training/video.mp4.\n"
-                'Example (PowerShell): -v "${PWD}\\video.mp4:/opt/ml/input/data/training/video.mp4:ro"'
+            # Dev mode: no mp4 at all. Let train_entry fall back to JPEG-dir if available.
+            print(
+                "[launcher] No .mp4 found under /opt/ml/input/data/training; "
+                "continuing (train_entry may use JPEG dir fallback).",
+                flush=True,
             )
-        if os.path.abspath(existing) != os.path.abspath(staged):
-            shutil.copy2(existing, staged)
+        else:
+            if os.path.abspath(existing) != os.path.abspath(staged):
+                shutil.copy2(existing, staged)
+
+                
 
     # 1) TRAIN
     env = dict(os.environ)                # 1) take the parent process env

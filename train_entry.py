@@ -32,16 +32,33 @@ def _find_single_mp4(search_dir: str) -> str:
                 return os.path.join(root, f)
     raise RuntimeError(f"No .mp4 found under {search_dir}. Did SageMaker mount the input?")
 
+def _find_jpeg_dir(search_dir: str):
+    """
+    Return the first directory under search_dir that contains any .jpg/.jpeg files,
+    or None if none found.
+    """
+    for root, _, files in os.walk(search_dir):
+        if any(f.lower().endswith((".jpg", ".jpeg")) for f in files):
+            return root
+    return None
+
 
 def main():
-    # Prefer the explicitly staged video.mp4 (used by run_train_then_convert --input)
+    # 0) Prefer explicitly staged /opt/ml/input/data/training/video.mp4
     staged = os.path.join(SM_TRAIN_DIR, "video.mp4")
     if os.path.exists(staged):
         video = staged
+        print(f"[train_entry] Using staged video.mp4: {video}", flush=True)
     else:
-        video = _find_single_mp4(SM_TRAIN_DIR)
-
-    print(f"[train_entry] Using training video: {video}", flush=True)
+        # 1) Next, prefer a JPEG directory (dev frames) if present
+        jpeg_dir = _find_jpeg_dir(SM_TRAIN_DIR)
+        if jpeg_dir:
+            video = jpeg_dir
+            print(f"[train_entry] Using JPEG dir as source: {video}", flush=True)
+        else:
+            # 2) Finally, fall back to any .mp4 under the training dir
+            video = _find_single_mp4(SM_TRAIN_DIR)
+            print(f"[train_entry] Using MP4 video: {video}", flush=True)
 
     h = _load_hps()
 

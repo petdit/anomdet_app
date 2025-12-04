@@ -3,10 +3,15 @@ import os, json, shlex, subprocess, argparse
 import numpy as np
 import torch
 import onnxruntime as ort
+import shutil
 import cv2
 import matplotlib
 matplotlib.use("Agg")  # headless save on servers/CI/WSL
 import matplotlib.pyplot as plt
+import random  # <-- add this
+
+
+
 # ---- same normalization as training ----
 IM_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1)
 IM_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1)
@@ -78,14 +83,29 @@ def extract_to_memmap(src_video: str, cache_root: str, *, size=224, roi=None,
     if keep_every and keep_every > 1: tag += f"__keep{int(keep_every)}"
     cache_dir = os.path.join(cache_root, f"{base}__{tag}")
     os.makedirs(cache_dir, exist_ok=True)
+
     raw_path = os.path.join(cache_dir, "frames.rgb")
+
+    # NEW: detect raw .rgb input
+    is_raw_rgb = src_video.lower().endswith(".rgb")
+
     if os.path.exists(raw_path) and not overwrite:
         N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi)
         return cache_dir, N
-    vf = build_vf_filter(size=size, roi=roi, keep_every=keep_every)
-    run_ffmpeg_to_raw(src_video, vf, threads, raw_path)
+
+    if is_raw_rgb:
+        # Just copy the raw RGB file into our cache location.
+        # Assumes frames are already [N, size, size, 3] uint8.
+        if os.path.abspath(src_video) != os.path.abspath(raw_path):
+            shutil.copyfile(src_video, raw_path)
+    else:
+        # Original FFmpeg extraction path for mp4 / other video formats.
+        vf = build_vf_filter(size=size, roi=roi, keep_every=keep_every)
+        run_ffmpeg_to_raw(src_video, vf, threads, raw_path)
+
     N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi)
     return cache_dir, N
+
 
 def open_memmap_cache(cache_dir: str):
     meta = json.load(open(os.path.join(cache_dir, "metadata.json"), "r"))
@@ -175,6 +195,8 @@ def main():
                 help="If >0, log per-frame mean/std every Nth window (normalized space).")
     ap.add_argument("--stat_samples", type=int, default=1,
                 help="How many batch samples to log per matching window.")
+    ap.add_argument(
+        "--save_error_maps", type=int, default=0, help="If >0, save this many error-map images (|pred-target|) for debugging.",)
 
     args = ap.parse_args()
 
@@ -184,8 +206,6 @@ def main():
         xs = [int(v) for v in args.roi.split(",")]
         if len(xs) != 4: raise SystemExit("--roi must be 'x,y,w,h'")
         roi = tuple(xs)
-    saved_pairs = 0
-    save_cap = 60   # how many early pairs to save
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -230,6 +250,24 @@ def main():
     print(f"[infer] cache={cache_dir}  frames={N}  seq_len={seq_len}  size={size}  "
           f"FP16={use_fp16}  providers_requested={providers}  providers_in_use={actual_providers}  onnx_input_type={input_type}")  # NEW
 
+    # how many target frames we’ll score: one target per sliding window
+    num_targets = max(0, N - seq_len)  # windows = N - seq_len
+
+    # existing fixed cap for pred|target debug pairs
+    save_cap = 60
+    saved_pairs = 0
+
+    # NEW: random sampling probabilities
+    if num_targets > 0:
+        p_pair = min(1.0, save_cap / num_targets)
+        p_err = 0.0
+        if getattr(args, "save_error_maps", 0) > 0:
+            p_err = min(1.0, args.save_error_maps / num_targets)
+    else:
+        p_pair = 0.0
+        p_err = 0.0
+
+    saved_errmaps = 0  # NEW: track how many error maps we’ve written
 
     T = seq_len + 1  # 4-in + 1-target for scoring
     device = "cuda" if (torch.cuda.is_available() and not args.cpu) else "cpu"
@@ -316,20 +354,41 @@ def main():
             all_starts.extend(starts.tolist())
             all_psnr_rgb.extend(_psnr_rgb.detach().cpu().tolist())
             all_psnr_luma.extend(_psnr_y.detach().cpu().tolist())
-            if saved_pairs < save_cap:
-            # save a grid for the first few samples of *this* batch (typically 1 is enough)
-                k = min(3, pred01.shape[0])  # don’t explode disk
-                for i in range(k):
-                    ti = int(starts[i]) + seq_len
-                    pred_u8 = (pred01[i].clamp(0,1).mul(255).to(torch.uint8).cpu().numpy())   # [3,H,W]
-                    tgt_u8  = (tgt01[i].clamp(0,1).mul(255).to(torch.uint8).cpu().numpy())    # [3,H,W]
-                    pred_bgr = cv2.cvtColor(np.transpose(pred_u8, (1,2,0)), cv2.COLOR_RGB2BGR)
-                    tgt_bgr  = cv2.cvtColor(np.transpose(tgt_u8,  (1,2,0)), cv2.COLOR_RGB2BGR)
+            # choose up to a few samples per batch for visual debug / error maps
+            k = min(3, pred01.shape[0])  # don’t explode disk
+
+            # --- randomized debug saving over all frames, not just the first ones ---
+            # one “target frame” per window/sample in this batch
+            for i in range(pred01.shape[0]):
+                ti = int(starts[i]) + seq_len  # global target frame index
+
+                # decide randomly whether to save pred|target pair for this frame
+                if saved_pairs < save_cap and random.random() < p_pair:
+                    pred_u8 = (pred01[i].clamp(0, 1).mul(255).to(torch.uint8).cpu().numpy())  # [3,H,W]
+                    tgt_u8  = (tgt01[i].clamp(0, 1).mul(255).to(torch.uint8).cpu().numpy())   # [3,H,W]
+
+                    pred_bgr = cv2.cvtColor(np.transpose(pred_u8, (1, 2, 0)), cv2.COLOR_RGB2BGR)
+                    tgt_bgr  = cv2.cvtColor(np.transpose(tgt_u8,  (1, 2, 0)), cv2.COLOR_RGB2BGR)
                     side = cv2.hconcat([pred_bgr, tgt_bgr])
-                    cv2.imwrite(os.path.join(args.out_dir, f"early_pair_t{ti:06d}.jpg"), side)
+
+                    cv2.imwrite(os.path.join(args.out_dir, f"debug_pair_t{ti:06d}.jpg"), side)
                     saved_pairs += 1
-                    if saved_pairs >= save_cap:
-                        break
+
+                # decide randomly whether to save an error map for this frame
+                if getattr(args, "save_error_maps", 0) > 0 and saved_errmaps < args.save_error_maps and random.random() < p_err:
+                    # per-pixel mean abs error across channels -> [H,W] in [0,1]
+                    err = (pred01[i] - tgt01[i]).abs().mean(dim=0)  # [H,W]
+                    max_val = err.max()
+                    if max_val > 0:
+                        err = err / max_val  # normalize for visualization
+
+                    err_u8 = err.mul(255).to(torch.uint8).cpu().numpy()  # [H,W]
+                    err_color = cv2.applyColorMap(err_u8, cv2.COLORMAP_JET)
+
+                    cv2.imwrite(os.path.join(args.out_dir, f"error_map_t{ti:06d}.jpg"), err_color)
+                    saved_errmaps += 1
+
+
     # write CSV
     csv_path = os.path.join(args.out_dir, "metrics.csv")
     with open(csv_path, "w") as f:

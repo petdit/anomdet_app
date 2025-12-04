@@ -249,6 +249,55 @@ def extract_to_memmap(src_video: str, cache_root: str,
                       threads: int = 1,
                       overwrite: bool = False) -> tuple[str, int]:
 
+    # --- HACK: if src_video is a directory, treat it as a directory of 224x224 JPEGs ---
+    if os.path.isdir(src_video):
+        base = os.path.basename(os.path.normpath(src_video))
+        cmode = "jpegdir"
+        tag = f"size{size}__{cmode}"
+        cache_dir = os.path.join(cache_root, f"{base}__{tag}")
+        os.makedirs(cache_dir, exist_ok=True)
+        raw_path = os.path.join(cache_dir, "frames.rgb")
+
+        if os.path.exists(raw_path) and not overwrite:
+            N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi=None)
+            return cache_dir, N
+
+        # collect JPEGs
+        jpgs = [
+            os.path.join(src_video, f)
+            for f in sorted(os.listdir(src_video))
+            if f.lower().endswith((".jpg", ".jpeg"))
+        ]
+        if not jpgs:
+            raise RuntimeError(f"[jpegdir] No JPEGs found under {src_video}")
+
+        print(f"[jpegdir] Building memmap from {len(jpgs)} JPEGs in {src_video}")
+
+
+        with open(raw_path, "wb") as f:
+            for p in jpgs:
+                im_bgr = cv2.imread(p, cv2.IMREAD_COLOR)
+                if im_bgr is None:
+                    raise RuntimeError(f"[jpegdir] Failed to read JPEG: {p}")
+                im_rgb = cv2.cvtColor(im_bgr, cv2.COLOR_BGR2RGB)
+                h, w, c = im_rgb.shape
+                if c != 3:
+                    raise RuntimeError(f"[jpegdir] Expected 3-channel RGB, got {im_rgb.shape} for {p}")
+
+                # your saved training frames should already be 224x224, but be defensive:
+                if (h, w) != (size, size):
+                    im_rgb = cv2.resize(im_rgb, (size, size), interpolation=cv2.INTER_AREA)
+
+                im_rgb = np.ascontiguousarray(im_rgb, dtype=np.uint8)
+                f.write(im_rgb.tobytes())
+
+        N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi=None)
+        return cache_dir, N
+    # --- END JPEG-DIR HACK ---
+
+
+
+
     base = os.path.splitext(os.path.basename(src_video))[0]
     cmode = "roi" if roi is not None else "auto"
     tag  = f"size{size}__{cmode}" + (f"_roi_{roi[0]}_{roi[1]}_{roi[2]}_{roi[3]}" if roi else "")
@@ -261,7 +310,7 @@ def extract_to_memmap(src_video: str, cache_root: str,
 
     _warn_if_not_4_3(src_video)
 
-    
+
     if os.path.exists(raw_path) and not overwrite:
         N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi)
         return cache_dir, N

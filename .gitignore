@@ -34,7 +34,7 @@ sample_input/training/out/
 *.ts.pt
 *.pte
 sample_input/training/**/artifacts/
-
+*.zip
 # --- Data / media / large/binary files to avoid pushing ---
 # Images / media
 *.[Pp][Nn][Gg]
