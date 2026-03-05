@@ -100,8 +100,8 @@ def main():
     args = ap.parse_args()
 
     # allow env vars to toggle in SageMaker without changing args
-    save_weights = args.save_weights or _env_flag("SAVE_WEIGHTS", False)
-    save_ts = args.save_ts or _env_flag("SAVE_TS", False)
+    save_weights = args.save_weights or _env_flag("ET_SAVE_WEIGHTS", False)
+    save_ts = args.save_ts or _env_flag("ET_SAVE_TS", False)
     convert_precision = _resolve_convert_precision(args.convert_precision)
     to_half = convert_precision == "16"
     os.makedirs(OUT_DIR, exist_ok=True)

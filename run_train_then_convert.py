@@ -31,39 +31,33 @@ def main():
     os.makedirs(SM_PROC_IN, exist_ok=True)
     os.makedirs(SM_PROC_OUT, exist_ok=True)
 
-    # stage input for training (support either --input or a pre-mounted file)
-    staged = os.path.join(SM_TRAIN_IN, "video.mp4")
+    data_mode = str(os.getenv("ET_DATA_MODE", "video")).strip().lower()
 
-    def _find_mp4(root: str):
-        for r, _, files in os.walk(root):
-            for f in files:
-                if f.lower().endswith(".mp4"):
-                    return os.path.join(r, f)
-        return None
+    if data_mode == "frames":
+        print(f"[launcher] frames mode: skipping MP4 staging, training dir={SM_TRAIN_IN}", flush=True)
+    else:
+        # stage input for training (support either --input or a pre-mounted file)
+        staged = os.path.join(SM_TRAIN_IN, "video.mp4")
 
-    if args.input:
-        if os.path.isdir(args.input):
-            # Dev mode: --input is a directory (e.g. JPEG dump). Don't stage anything;
-            # train_entry.py will pick it up as a JPEG dir.
-            print(f"[launcher] --input is a directory: {args.input} (JPEG/dev mode)", flush=True)
-        else:
-            # Normal mp4 path
+        def _find_mp4(root: str):
+            for r, _, files in os.walk(root):
+                for f in files:
+                    if f.lower().endswith(".mp4"):
+                        return os.path.join(r, f)
+            return None
+
+        if args.input:
             if not (os.path.isfile(args.input) and args.input.lower().endswith(".mp4")):
-                sys.exit("ERROR: --input must be a readable .mp4 file or a directory")
+                sys.exit("ERROR: --input must be a readable .mp4 file")
             if os.path.abspath(args.input) != os.path.abspath(staged):
                 shutil.copy2(args.input, staged)
-    else:
-        existing = _find_mp4(SM_TRAIN_IN)
-        if not existing:
-            # Dev mode: no mp4 at all. Let train_entry fall back to JPEG-dir if available.
-            print(
-                "[launcher] No .mp4 found under /opt/ml/input/data/training; "
-                "continuing (train_entry may use JPEG dir fallback).",
-                flush=True,
-            )
         else:
-            if os.path.abspath(existing) != os.path.abspath(staged):
-                shutil.copy2(existing, staged)
+            existing = _find_mp4(SM_TRAIN_IN)
+            if not existing:
+                sys.exit("ERROR: no mp4 found in /opt/ml/input/data/training")
+            else:
+                if os.path.abspath(existing) != os.path.abspath(staged):
+                    shutil.copy2(existing, staged)
 
                 
 

@@ -86,89 +86,11 @@ def _save_sequence_jpegs(seq_tchw_u8: np.ndarray, out_dir: str, prefix: str):
     cv2.imwrite(os.path.join(out_dir, f"{prefix}_strip.jpg"), cv2.hconcat(tiles))
 
 
-# -------------- extraction ------------------
-def _warn_if_not_4_3(video_path: str, tol: float = 0.01):
-    """
-    Print a warning if the source video's aspect ratio is not ~4:3.
-    tol is the allowed absolute difference in aspect ratio (e.g. 0.01 ≈ 1%).
-    """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"[warn] Could not open video for aspect check: {video_path}")
-        return
 
-    w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    cap.release()
-
-    if w <= 0 or h <= 0:
-        print(f"[warn] Invalid width/height for aspect check: {video_path} (w={w}, h={h})")
-        return
-
-    ar = w / h
-    target = 4.0 / 3.0
-    if abs(ar - target) > tol:
-        print(
-            f"[warn] Source aspect ratio is {ar:.4f} ({int(w)}x{int(h)}), "
-            f"expected ~4:3 ({target:.4f}). "
-            "Frames will be rescaled to 240x320 before cropping."
-        )
 
 def default_cache_root():
     # User can override in the container / SageMaker job
     return os.environ.get("FRAMECACHE_DIR", "/opt/ml/.cache/frames")
-
-def build_vf_filter(size: int,
-                    roi: tuple[int, int, int, int] | None,
-                    keep_every: int | None) -> str:
-    """
-    Build -vf chain (mirrors Android/Kotlin buildVfFilter):
-      1) optional exact frame stepping (select=not(mod(n,keep)))
-      2a) if ROI is given:
-            crop ROI, then scale to size×size
-         else:
-            scale to 240x320, then crop a size×size square
-            (horizontally centered, bottom-aligned)
-      3) format=rgb24
-      4) setsar=1
-    """
-    parts: list[str] = []
-
-    # 1) Optional decimation
-    if keep_every and keep_every > 1:
-        # note: ffmpeg select expression needs quoting; this matches your old code
-        parts.append(f"select='not(mod(n,{keep_every}))',setpts=N/FRAME_RATE/TB")
-
-    if roi is not None:
-        # 2a) Explicit ROI: crop ROI, then scale to size×size
-        x, y, w, h = roi
-        parts.append(f"crop={w}:{h}:{x}:{y}")
-        parts.append(f"scale={size}:{size}:flags=area")
-    else:
-        # 2b) No ROI: mimic ONLINE rotated pipeline
-        preview_w = 240
-        preview_h = 320
-
-        # Step 1: scale to 240x320
-        parts.append(f"scale={preview_w}:{preview_h}:flags=area")
-
-        # Step 2: crop size x size from this 240x320 frame
-        crop_x = (preview_w - size) // 2
-        crop_y = preview_h - size
-
-        if crop_x < 0 or crop_y < 0:
-            raise ValueError(
-                f"Cannot crop {size}x{size} from {preview_w}x{preview_h} "
-                f"(computed crop_x={crop_x}, crop_y={crop_y})"
-            )
-
-        parts.append(f"crop={size}:{size}:{crop_x}:{crop_y}")
-
-    # 3) Final format + SAR
-    parts.append("format=rgb24")
-    parts.append("setsar=1")
-
-    return ",".join(parts)
 
 
 def run_ffmpeg_to_raw(src_video: str, vf: str, threads: int, raw_path: str):
@@ -177,13 +99,14 @@ def run_ffmpeg_to_raw(src_video: str, vf: str, threads: int, raw_path: str):
     to a single binary file at raw_path. This is stream-only: no temp images.
     """
     
-
+    threads_flag = f"-threads {threads}" if threads and threads > 0 else ""
     cmd = (
         f'ffmpeg -hide_banner -loglevel error -nostdin '
-        f'-threads {threads} -i "{src_video}" '
-        f'-an -sn -dn '                        # no audio/subs/data
+        f'{threads_flag} '
+        f'-i "{src_video}" '
+        f'-an -sn -dn '
         f'-vf "{vf}" '
-        f'-f rawvideo -pix_fmt rgb24 -vsync vfr -y -'  # raw frames to stdout
+        f'-f rawvideo -pix_fmt rgb24 -vsync vfr -y -'
     )
     with open(raw_path, "wb") as f:
         # stream stdout (raw bytes) directly to the file
@@ -193,7 +116,7 @@ def run_ffmpeg_to_raw(src_video: str, vf: str, threads: int, raw_path: str):
             raise RuntimeError(f"ffmpeg exited with code {ret}")
         
 def finalize_memmap(raw_path: str, dst_dir: str, size: int,
-                    src_video: str, keep_every, roi):
+                    src_video: str):
 
     bytes_per_frame = size * size * 3
     total_bytes = os.path.getsize(raw_path)
@@ -201,16 +124,11 @@ def finalize_memmap(raw_path: str, dst_dir: str, size: int,
         raise ValueError(f"Raw size {total_bytes} not divisible by frame size {bytes_per_frame}")
     N = total_bytes // bytes_per_frame
 
-    crop_mode = "roi" if roi is not None else "auto"
     meta = {
         "src_video": src_video,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "shape": {"N": int(N), "H": size, "W": size, "C": 3, "layout": "NHWC", "dtype": "uint8"},
         "filters": {
-            "keep_every": keep_every or 1,
-            "crop_mode": crop_mode,
-            "roi": roi,
-            "scale": size,
             "pix_fmt": "rgb24"
         },
         "notes": "raw rgb24 frames written sequentially; use np.memmap with shape [N,H,W,3]"
@@ -244,87 +162,71 @@ def window_indices(N: int, T: int):
 
 def extract_to_memmap(src_video: str, cache_root: str,
                       *, size: int = 224,
-                      roi: tuple[int,int,int,int] | None = None,
-                      keep_every: int | None = None,
                       threads: int = 1,
                       overwrite: bool = False) -> tuple[str, int]:
-
-    # --- HACK: if src_video is a directory, treat it as a directory of 224x224 JPEGs ---
-    if os.path.isdir(src_video):
-        base = os.path.basename(os.path.normpath(src_video))
-        cmode = "jpegdir"
-        tag = f"size{size}__{cmode}"
-        cache_dir = os.path.join(cache_root, f"{base}__{tag}")
-        os.makedirs(cache_dir, exist_ok=True)
-        raw_path = os.path.join(cache_dir, "frames.rgb")
-
-        if os.path.exists(raw_path) and not overwrite:
-            N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi=None)
-            return cache_dir, N
-
-        # collect JPEGs
-        jpgs = [
-            os.path.join(src_video, f)
-            for f in sorted(os.listdir(src_video))
-            if f.lower().endswith((".jpg", ".jpeg"))
-        ]
-        if not jpgs:
-            raise RuntimeError(f"[jpegdir] No JPEGs found under {src_video}")
-
-        print(f"[jpegdir] Building memmap from {len(jpgs)} JPEGs in {src_video}")
-
-
-        with open(raw_path, "wb") as f:
-            for p in jpgs:
-                im_bgr = cv2.imread(p, cv2.IMREAD_COLOR)
-                if im_bgr is None:
-                    raise RuntimeError(f"[jpegdir] Failed to read JPEG: {p}")
-                im_rgb = cv2.cvtColor(im_bgr, cv2.COLOR_BGR2RGB)
-                h, w, c = im_rgb.shape
-                if c != 3:
-                    raise RuntimeError(f"[jpegdir] Expected 3-channel RGB, got {im_rgb.shape} for {p}")
-
-                # your saved training frames should already be 224x224, but be defensive:
-                if (h, w) != (size, size):
-                    im_rgb = cv2.resize(im_rgb, (size, size), interpolation=cv2.INTER_AREA)
-
-                im_rgb = np.ascontiguousarray(im_rgb, dtype=np.uint8)
-                f.write(im_rgb.tobytes())
-
-        N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi=None)
-        return cache_dir, N
-    # --- END JPEG-DIR HACK ---
-
 
 
 
     base = os.path.splitext(os.path.basename(src_video))[0]
-    cmode = "roi" if roi is not None else "auto"
-    tag  = f"size{size}__{cmode}" + (f"_roi_{roi[0]}_{roi[1]}_{roi[2]}_{roi[3]}" if roi else "")
-    if keep_every and keep_every > 1:
-        tag += f"__keep{keep_every}"
+    tag = f"size{size}__precrop"
+
     cache_dir = os.path.join(cache_root, f"{base}__{tag}")
     os.makedirs(cache_dir, exist_ok=True)
 
     raw_path = os.path.join(cache_dir, "frames.rgb")
 
-    _warn_if_not_4_3(src_video)
-
 
     if os.path.exists(raw_path) and not overwrite:
-        N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi)
+        meta_path = os.path.join(cache_dir, "metadata.json")
+        if os.path.exists(meta_path):
+            meta = json.load(open(meta_path, "r"))
+            H = int(meta["shape"]["H"])
+            W = int(meta["shape"]["W"])
+            if H != size or W != size:
+                raise ValueError(
+                    f"Cache exists but shape is {W}x{H}, expected {size}x{size}. "
+                    f"Delete cache_dir={cache_dir} or set overwrite_cache=true."
+                )
+        else:
+            # Fallback: check the source video itself
+            cap = cv2.VideoCapture(src_video)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            cap.release()
+            if w != size or h != size:
+                raise ValueError(
+                    f"Expected pre-cropped video of {size}x{size}, got {w}x{h} for {src_video}. "
+                    f"Cache has no metadata.json, refusing to assume geometry."
+                )
+
+        N = finalize_memmap(raw_path, cache_dir, size, src_video)
         return cache_dir, N
 
-    vf = build_vf_filter(size=size, roi=roi, keep_every=keep_every)
+    vf = "format=rgb24,setsar=1"
     run_ffmpeg_to_raw(src_video, vf, threads, raw_path)
-    N = finalize_memmap(raw_path, cache_dir, size, src_video, keep_every, roi)
+
+    cap = cv2.VideoCapture(src_video)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    cap.release()
+
+    if w != size or h != size:
+        raise ValueError(
+            f"Expected pre-cropped video of {size}x{size}, got {w}x{h} for {src_video}. "
+            f"Refusing to proceed because AWS-side resizing/cropping is disabled."
+        )
+
+
+    N = finalize_memmap(raw_path, cache_dir, size, src_video)
     return cache_dir, N
 
 def memmap_window_batch_iter(cache_dir: str, *,
                              T: int, batch_size: int,
+                             frame_stride: int = 1,
                              sequences_per_epoch: int | None = None,
                              rng=None,
                              return_indices: bool = False):
+
     """
     Yields:
       - if return_indices=False: torch.uint8 [B,T,3,H,W]
@@ -333,7 +235,12 @@ def memmap_window_batch_iter(cache_dir: str, *,
     import random as _rnd, numpy as np, torch
     arr, meta = open_memmap_cache(cache_dir)      # arr: [N,H,W,3] uint8
     N, H, W, _ = arr.shape
-    starts = list(range(0, max(0, N - T + 1)))
+
+    S = int(frame_stride) if frame_stride and frame_stride > 0 else 1
+    max_start_exclusive = N - (T - 1) * S
+    starts = list(range(0, max(0, max_start_exclusive))) 
+
+
     rng = rng or _rnd
     rng.shuffle(starts)
     if sequences_per_epoch is not None:
@@ -341,7 +248,8 @@ def memmap_window_batch_iter(cache_dir: str, *,
 
     batch, batch_idx = [], []
     for s in starts:
-        win = arr[s:s+T]                          # [T,H,W,3]
+        idx = np.arange(s, s + T * S, S, dtype=np.int64)  # length T
+        win = arr[idx]                       # [T,H,W,3]
         win = np.transpose(win, (0, 3, 1, 2))     # [T,3,H,W]
         batch.append(win); batch_idx.append(s)
         if len(batch) == batch_size:
@@ -359,6 +267,120 @@ def memmap_window_batch_iter(cache_dir: str, *,
             yield bt
 
 
+
+
+# ------------- frame-folder data loader (backdoor for phone frames + R&D PNG folders) -------------
+
+def frames_folder_batch_iter(frames_dir: str, *,
+                             T: int,
+                             batch_size: int,
+                             frame_stride: int = 1,
+                             sequences_per_epoch=None,
+                             rng=None,
+                             data_format: str = "auto"):
+    """
+    Yields torch.uint8 batches [B, T, 3, H, W] from pre-extracted frames.
+
+    data_format="bin"   : window_XXXXXXX.bin files saved by Android frame capture.
+                          Each file = T+1 frames × H×W×3 bytes (NHWC uint8).
+                          frame_stride is embedded in the window files; pass 1 here.
+    data_format="image" : sorted PNG/JPG files in frames_dir, builds sliding windows
+                          of T+1 frames with the given frame_stride.
+    data_format="auto"  : detect by checking if .bin files are present.
+
+    Normalization is NOT applied here — same as memmap_window_batch_iter.
+    The training loop handles normalize -> augment -> split.
+    """
+    import random as _rnd, glob as _glob, os
+
+    frames_dir = str(frames_dir)
+    rng = rng or _rnd
+
+    if data_format == "auto":
+        has_bin = bool(_glob.glob(os.path.join(frames_dir, "window_*.bin")))
+        data_format = "bin" if has_bin else "image"
+
+    if data_format == "bin":
+        # --- Phone .bin windows ---
+        bin_files = sorted(_glob.glob(os.path.join(frames_dir, "window_*.bin")))
+        if not bin_files:
+            raise FileNotFoundError(f"No window_*.bin files found in {frames_dir}")
+
+        # Infer H, W from first file: file_size = (T+1) * H * W * 3
+        file_size = os.path.getsize(bin_files[0])
+        frames_per_file = T + 1
+        pix = file_size // (frames_per_file * 3)
+        H = W = int(pix ** 0.5)
+        if H * W * 3 * frames_per_file != file_size:
+            raise ValueError(
+                f"Cannot infer square resolution from file size {file_size} "
+                f"with T+1={frames_per_file} frames and 3 channels"
+            )
+
+        all_files = list(bin_files)
+        rng.shuffle(all_files)
+        if sequences_per_epoch is not None:
+            all_files = all_files[:sequences_per_epoch]
+
+        batch = []
+        for path in all_files:
+            raw = np.frombuffer(open(path, "rb").read(), dtype=np.uint8)
+            # shape: [(T+1), H, W, 3]  NHWC
+            win_nhwc = raw.reshape(frames_per_file, H, W, 3)
+            win_tchw = np.transpose(win_nhwc, (0, 3, 1, 2))   # [T+1, 3, H, W]
+            batch.append(win_tchw)
+            if len(batch) == batch_size:
+                yield torch.from_numpy(np.stack(batch, axis=0))   # [B, T+1, 3, H, W]
+                batch = []
+        if batch:
+            yield torch.from_numpy(np.stack(batch, axis=0))
+
+    elif data_format == "image":
+        # --- PNG/JPG folder: sorted files, sliding windows ---
+        import cv2 as _cv2
+        exts = (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG")
+        all_imgs = sorted([
+            f for f in os.listdir(frames_dir)
+            if any(f.endswith(e) for e in exts)
+        ])
+        N = len(all_imgs)
+        S = max(1, int(frame_stride))
+        frames_needed = T + 1
+        max_start = N - (frames_needed - 1) * S
+        if max_start <= 0:
+            raise ValueError(
+                f"Not enough frames: need {frames_needed} with stride {S}, have {N}"
+            )
+
+        starts = list(range(max_start))
+        rng.shuffle(starts)
+        if sequences_per_epoch is not None:
+            starts = starts[:sequences_per_epoch]
+
+        # Cache loaded images to avoid re-reading the same file many times
+        _cache = {}
+        def _load(idx):
+            if idx not in _cache:
+                path = os.path.join(frames_dir, all_imgs[idx])
+                bgr = _cv2.imread(path)
+                if bgr is None:
+                    raise IOError(f"Failed to read image: {path}")
+                rgb = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
+                _cache[idx] = np.transpose(rgb, (2, 0, 1))  # [3, H, W]
+            return _cache[idx]
+
+        batch = []
+        for s in starts:
+            idx_list = [s + t * S for t in range(frames_needed)]
+            win = np.stack([_load(i) for i in idx_list], axis=0)  # [T+1, 3, H, W]
+            batch.append(win)
+            if len(batch) == batch_size:
+                yield torch.from_numpy(np.stack(batch, axis=0))
+                batch = []
+        if batch:
+            yield torch.from_numpy(np.stack(batch, axis=0))
+    else:
+        raise ValueError(f"Unknown data_format: {data_format!r}. Use 'bin', 'image', or 'auto'.")
 
 
 # ------------- loss functions ------------
@@ -385,7 +407,7 @@ def gradient_loss_luma(p01, t01):
     dyt = (Yt[:,:,1:,:] - Yt[:,:,:-1,:]).abs()
     return (dxp - dxt).abs().mean() + (dyp - dyt).abs().mean()
 
-def combined_loss(predicted, target, alpha=0.7, beta=0.17, gamma=0.13):
+def combined_loss(predicted, target, alpha=0.6, beta=0.25, gamma=0.15):
     p_lin, t_lin = denorm_linear(predicted), denorm_linear(target)
     pix_loss = charbonnier(p_lin - t_lin)
     p01, t01 = denorm01(predicted), denorm01(target)
@@ -409,10 +431,10 @@ def _affine_sequence(seq_tchw: torch.Tensor, angle_deg: float, tx_frac: float, t
     return F.grid_sample(seq_tchw, grid, mode="bilinear", padding_mode="border", align_corners=False).clamp(0,1)
 
 def _lightshift_sequence(seq_tchw: torch.Tensor,
-                         base_b_range=(0.9, 1.1),     # match old
+                         base_b_range=(0.9, 1.1),
                          base_c_range=(0.9, 1.1),
-                         jitter_amp=0.03,             # old had per-frame jitter
-                         consistent_across_T=False):  # set True to disable per-frame jitter
+                         jitter_amp=0.01,
+                         consistent_across_T=False):  # False = per-frame jitter enabled (matches R&D)
     T, C, H, W = seq_tchw.shape
     device, dtype = seq_tchw.device, seq_tchw.dtype
 
@@ -484,7 +506,7 @@ def apply_augment(batch_btchw, mode="std"):
             ty    = _rnd.uniform(-0.02, 0.02)
             x[b]  = _affine_sequence(x[b], angle_deg=angle, tx_frac=tx, ty_frac=ty)
         if use_light:
-            x[b]  = _lightshift_sequence(x[b], base_b_range=(0.9,1.1), base_c_range=(0.9,1.1), jitter_amp=0.03)
+            x[b]  = _lightshift_sequence(x[b], base_b_range=(0.9,1.1), base_c_range=(0.9,1.1), jitter_amp=0.01)
         if use_shadow:
             m = _shadow_mask((H,W)).to(x.device).unsqueeze(0)  # [1,H,W]
             x[b] = (x[b] * m).clamp(0,1)
@@ -497,18 +519,19 @@ def apply_augment(batch_btchw, mode="std"):
 
 def train_on_video_local(local_video_path: str,
                          out_dir_local: str,
+                         frame_stride: int = 1,
                          seq_len=4, epochs=1, lr=5e-4,
                          augment_mode="none",
                          loss_mode="combined",
-                         alpha=0.7, beta=0.17, gamma=0.13,
+                         alpha=0.6, beta=0.25, gamma=0.15,
                          batch_size=16, size=224,
                          seed=None,
                          save_weights=True, save_ts=True,
-                         keep_every=None, sequences_per_epoch=4000,
-                         roi=None,
+                         sequences_per_epoch=4000,
                          vis_sequences: int = 6,
                          threads: int = 0,
-                         overwrite_cache: bool = False):
+                         overwrite_cache: bool = False,
+                         data_mode: str = "video"):
     """
     Build/open memmap -> iterate 5-frame windows -> augment full window -> split 4+1 ->
     normalize -> train -> log stats -> save previews/pred-vs-target once/epoch.
@@ -520,19 +543,25 @@ def train_on_video_local(local_video_path: str,
         _rnd.seed(seed); _np.random.seed(seed)
 
     os.makedirs(out_dir_local, exist_ok=True)
-    keep_every = None if keep_every in (None, 0) else int(keep_every)
-    # ---- Build/open cache (SageMaker-friendly) ----
-    cache_root = default_cache_root()
-    cache_dir, N = extract_to_memmap(
-        src_video=local_video_path,
-        cache_root=cache_root,
-        size=size,
-        roi=roi,
-        keep_every=keep_every,
-        threads=threads,
-        overwrite=overwrite_cache
-    )
-    print(f"[cache] dir={cache_dir}  frames(N)={N}  windows(T={seq_len+1})={max(0, N-(seq_len+1)+1)}")
+
+    # ---- data_mode routing ----
+    # "video"  (default): MP4 -> ffmpeg -> memmap cache
+    # "frames": local_video_path is a directory of window_*.bin or PNG/JPG frames
+    if data_mode == "frames":
+        cache_dir = None  # unused in frames mode
+        N = None
+        print(f"[data] frames mode: dir={local_video_path}")
+    else:
+        # ---- Build/open cache (SageMaker-friendly) ----
+        cache_root = default_cache_root()
+        cache_dir, N = extract_to_memmap(
+            src_video=local_video_path,
+            cache_root=cache_root,
+            size=size,
+            threads=threads,
+            overwrite=overwrite_cache
+        )
+        print(f"[cache] dir={cache_dir}  frames(N)={N}  windows(T={seq_len+1})={max(0, N-(seq_len+1)+1)}")
 
     # ---- device / model / optim / loss ----
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -575,7 +604,9 @@ def train_on_video_local(local_video_path: str,
     T = seq_len + 1  # 4-in + 1-target
     saved = 0
 
-
+    frame_stride = int(frame_stride) if frame_stride is not None else 1
+    if frame_stride < 1:
+        raise ValueError(f"frame_stride must be >= 1, got {frame_stride}")
 
     #sanity check, remove -----------
     def _count_params(pp): return sum(p.numel() for p in pp)
@@ -602,16 +633,33 @@ def train_on_video_local(local_video_path: str,
         running_count = 0
         first_stats_print = True
 
-        it = memmap_window_batch_iter(cache_dir,
-                                      T=T, batch_size=batch_size,
-                                      sequences_per_epoch=sequences_per_epoch,
-                                      rng=random, return_indices=True)
+        if data_mode == "frames":
+            # frames_folder_batch_iter doesn't support return_indices; wrap with enumerate
+            _raw_it = frames_folder_batch_iter(
+                local_video_path,
+                T=seq_len,  # yields [B, T+1, 3, H, W]; the +1 is handled inside
+                batch_size=batch_size,
+                frame_stride=frame_stride,
+                sequences_per_epoch=sequences_per_epoch,
+                rng=random,
+            )
+            # Produce fake start indices for logging compatibility (0, batch_size, 2*batch_size, ...)
+            it = (
+                (b_u8, np.arange(bi * batch_size, bi * batch_size + b_u8.shape[0], dtype=np.int64))
+                for bi, b_u8 in enumerate(_raw_it)
+            )
+        else:
+            it = memmap_window_batch_iter(cache_dir,
+                                          T=T, batch_size=batch_size,
+                                          frame_stride=frame_stride,
+                                          sequences_per_epoch=sequences_per_epoch,
+                                          rng=random, return_indices=True)
 
         for batch_idx, (b_u8, starts) in enumerate(it, start=1):
             # print indices for every sequence in this batch
             if first_stats_print:
                 for s in starts.tolist():
-                    print(f"  win start={s:06d} -> target={s+seq_len:06d}")
+                    print(f"  win start={s:06d} -> target={s + seq_len*frame_stride:06d} (stride={frame_stride})")
 
             # ---- H2D + to [0,1] ----
             if device == "cuda":
@@ -730,24 +778,29 @@ def train_on_video_local(local_video_path: str,
         "alpha": alpha, "beta": beta, "gamma": gamma,
         "epochs": epochs, "lr": lr,
         "sampler": {
-            "native_fps": _get_native_fps(local_video_path),
-            "keep_every": keep_every,         # now provided directly
+            "native_fps": (_get_native_fps(local_video_path) if data_mode != "frames" else None),
+             "frame_stride": frame_stride,
             "seq_len": seq_len,
-            "stride_effective": 1,
             "sequences_per_epoch": sequences_per_epoch
         },
         "seed": seed,
 
         # extras (won’t break old readers; useful for debugging):
+        "data_mode": data_mode,
         "framecache": {
             "cache_dir": cache_dir,
-            "frames_N": int(N),
+            "frames_N": int(N) if N is not None else None,
             "window_T": int(seq_len + 1),
-            "roi": roi,
             "scale": size,
             "pix_fmt": "rgb24"
         },
-        "encoder_train_strategy": "bn_affine_only + layer4"  # documents the current baseline
+        "encoder_train_strategy": {
+            "mode": "full_finetune",
+            "encoder_frozen": False,
+            "bn_affine_trainable": True,
+            "bn_running_stats": "train",
+            "layer4_special_handling": False
+        }
     }
     local_meta = os.path.join(out_dir_local, "metadata.json")
     with open(local_meta, "w") as f:
